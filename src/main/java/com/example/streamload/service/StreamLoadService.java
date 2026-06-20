@@ -178,9 +178,6 @@ public class StreamLoadService {
                     os.write(payload);
                     os.flush();
                 }
-                
-                // 优化: 立即读取响应，减少连接空闲时间
-                conn.getInputStream().close();
 
                 // 读取响应
                 int statusCode = conn.getResponseCode();
@@ -309,21 +306,15 @@ public class StreamLoadService {
             boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
             
             if (isInternalIp) {
-                if (properties.isUseNginxProxy()) {
-                    // 开发环境：使用 Nginx 代理，将内部 IP 重写为直接访问 BE
-                    // 避免重新走 Nginx/FE 造成无限重定向循环
-                    String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
-                            redirectUrl.getProtocol(),
-                            properties.getBeHttpPort(),
-                            redirectUrl.getPath(),
-                            redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
-                    log.debug("Nginx 代理模式：内部 IP 重定向，重写为直接访问 BE: {}", rewritten);
-                    return rewritten;
-                } else {
-                    // 生产环境：直连 Doris，直接使用重定向 URL（已经是 BE 地址）
-                    log.debug("直连模式：使用重定向 URL: {}", location);
-                    return location;
-                }
+                // 无论是 Nginx 代理还是直连，遇到内部 IP 都需要重写为 127.0.0.1:8040
+                // 因为宿主机无法直接访问 Docker 容器内部 IP
+                String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
+                        redirectUrl.getProtocol(),
+                        properties.getBeHttpPort(),
+                        redirectUrl.getPath(),
+                        redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+                log.debug("检测到内部 IP，重写为直接访问 BE: {}", rewritten);
+                return rewritten;
             }
             return location;
         } catch (Exception e) {
