@@ -111,4 +111,11 @@ public class DorisProperties {
      * 消费者状态检查间隔 (行数)
      */
     private int consumerCheckInterval = 10000;
+    
+    /**
+     * 是否使用 Nginx 代理
+     * true: 开发环境，通过 Nginx 代理访问 Doris
+     * false: 生产环境，直接连接 Doris
+     */
+    private boolean useNginxProxy = true;
 }

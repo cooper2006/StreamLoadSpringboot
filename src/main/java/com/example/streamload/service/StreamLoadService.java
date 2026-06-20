@@ -297,8 +297,9 @@ public class StreamLoadService {
 
     /**
      * 重写重定向 URL，处理 Docker 内部 IP
-     * 在 Nginx 代理场景下，将重定向 URL 重写回 Nginx 代理地址
-     * 在直连场景下，将内部 IP 替换为 127.0.0.1，端口改为 BE HTTP 端口
+     * 
+     * @param location 重定向 URL
+     * @return 处理后的 URL
      */
     private String rewriteRedirectUrl(String location) {
         try {
@@ -308,15 +309,21 @@ public class StreamLoadService {
             boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
             
             if (isInternalIp) {
-                // 内部 IP 说明是 Docker 容器 IP，需要用宿主机映射端口直接访问 BE
-                // 避免重新走 Nginx/FE 造成无限重定向循环
-                String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
-                        redirectUrl.getProtocol(),
-                        properties.getBeHttpPort(),
-                        redirectUrl.getPath(),
-                        redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
-                log.debug("内部 IP 重定向，重写为直接访问 BE: {}", rewritten);
-                return rewritten;
+                if (properties.isUseNginxProxy()) {
+                    // 开发环境：使用 Nginx 代理，将内部 IP 重写为直接访问 BE
+                    // 避免重新走 Nginx/FE 造成无限重定向循环
+                    String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
+                            redirectUrl.getProtocol(),
+                            properties.getBeHttpPort(),
+                            redirectUrl.getPath(),
+                            redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+                    log.debug("Nginx 代理模式：内部 IP 重定向，重写为直接访问 BE: {}", rewritten);
+                    return rewritten;
+                } else {
+                    // 生产环境：直连 Doris，直接使用重定向 URL（已经是 BE 地址）
+                    log.debug("直连模式：使用重定向 URL: {}", location);
+                    return location;
+                }
             }
             return location;
         } catch (Exception e) {
