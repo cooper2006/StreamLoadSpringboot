@@ -194,11 +194,14 @@ public class DataPipeline implements ProducerState, ConsumerState {
                 totalRecords++;
 
                 if (batch.size() >= properties.getBatchSize()) {
+                    // 优化: 减少日志输出，只在关键节点记录
+                    if (batchIndex % 10 == 0) {
+                        log.info("生产者: 批次 {} 已入队, 累计 {} 条", batchIndex, producedRecordCount.get());
+                    }
                     BatchData batchData = new BatchData(batchIndex, new ArrayList<>(batch));
                     queue.put(batchData); // 阻塞等待消费者取走
                     producedBatchCount.incrementAndGet();
                     producedRecordCount.addAndGet(batch.size());
-                    log.info("生产者: 批次 {} 已入队, 累计 {} 条", batchIndex, producedRecordCount.get());
                     batch.clear();
                     batchIndex++;
                 }
@@ -283,8 +286,11 @@ public class DataPipeline implements ProducerState, ConsumerState {
                     if (result.isSuccess()) {
                         consumedBatchCount.incrementAndGet();
                         importedRecordCount.addAndGet(result.getRecordCount());
-                        log.info("消费者: 批次 {} 导入成功, 累计 {} 条",
-                                batchData.getBatchIndex(), importedRecordCount.get());
+                        // 优化: 减少日志输出，每10批记录一次
+                        if (consumedBatchCount.get() % 10 == 0) {
+                            log.info("消费者: 批次 {} 导入成功, 累计 {} 条",
+                                    batchData.getBatchIndex(), importedRecordCount.get());
+                        }
                     } else {
                         int failed = failedBatchCount.incrementAndGet();
                         log.error("消费者: 批次 {} 导入失败 (累计失败 {} 批): {}",
