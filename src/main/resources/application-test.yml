@@ -18,7 +18,7 @@ doris:
   # Stream Load HTTP 地址
   # 开发环境：通过 Nginx 代理 (18030)
   # 生产环境：直接连接 Doris FE (8030)
-  load-url: http://127.0.0.1:8030
+  load-url: http://127.0.0.1:18030
   # 目标数据库
   database: test_db
   # 认证信息 (根据实际环境修改)
@@ -41,7 +41,7 @@ doris:
   # 是否使用 Nginx 代理
   # true: 开发环境，通过 Nginx 代理访问 Doris（需要处理重定向循环）
   # false: 生产环境，直接连接 Doris（无需处理重定向）
-  use-nginx-proxy: false
+  use-nginx-proxy: true
 
 # 验证配置
 verify:
