@@ -23,13 +23,14 @@ public class CheckpointManager {
     private final ObjectMapper objectMapper;
     private final Set<Integer> completedBatches;
     private final AtomicInteger lastSaveCount;
-    private static final int SAVE_INTERVAL = 10; // 每 10 个批次保存一次
+    private final int saveInterval;
     
     public CheckpointManager(com.example.streamload.config.DorisProperties properties) {
         this.checkpointFile = properties.getCheckpointFile();
         this.objectMapper = new ObjectMapper();
         this.completedBatches = loadCheckpoint();
         this.lastSaveCount = new AtomicInteger(completedBatches.size());
+        this.saveInterval = properties.getCheckpointSaveInterval();
     }
     
     /**
@@ -62,11 +63,11 @@ public class CheckpointManager {
     public void markBatchCompleted(int batchIndex) {
         completedBatches.add(batchIndex);
         
-        // 优化: 使用 AtomicInteger 计数，每 SAVE_INTERVAL 个批次保存一次
+        // 优化: 使用 AtomicInteger 计数，每 saveInterval 个批次保存一次
         int currentCount = completedBatches.size();
-        if (currentCount - lastSaveCount.get() >= SAVE_INTERVAL) {
+        if (currentCount - lastSaveCount.get() >= saveInterval) {
             // 只有第一个到达阈值的线程执行保存
-            int expected = currentCount - (currentCount % SAVE_INTERVAL);
+            int expected = currentCount - (currentCount % saveInterval);
             if (lastSaveCount.compareAndSet(expected, currentCount)) {
                 saveCheckpoint();
             }

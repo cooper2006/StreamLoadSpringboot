@@ -48,9 +48,6 @@ public class DataPipeline implements ProducerState, ConsumerState {
     private final AtomicBoolean consumerCompleted = new AtomicBoolean(false);
     private final AtomicReference<Throwable> consumerError = new AtomicReference<>(null);
 
-    // 最大允许失败批次数，超过则停止
-    private static final int MAX_FAILED_BATCHES = 3;
-
     // 毒丸 (标识生产者完成)
     private static final BatchData POISON_PILL = new BatchData(-1, Collections.emptyList());
 
@@ -58,9 +55,6 @@ public class DataPipeline implements ProducerState, ConsumerState {
     private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT =
             ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
 
-    // 消费者线程数（并行导入）
-    private static final int CONSUMER_THREADS = 3;
-    
     public DataPipeline(JdbcTemplate jdbcTemplate,
                         StreamLoadService streamLoadService,
                         DorisProperties properties,
@@ -71,9 +65,7 @@ public class DataPipeline implements ProducerState, ConsumerState {
         this.properties = properties;
         this.sourceSql = sourceSql;
         this.tableName = tableName;
-        // 优化: 队列容量从16降低到8，减少内存峰值
-        // 队列容量8 × 批次大小50000 = 40万行同时在队列中，约80MB内存
-        this.queue = new LinkedBlockingQueue<>(8);
+        this.queue = new LinkedBlockingQueue<>(properties.getQueueCapacity());
     }
 
     /**
@@ -83,13 +75,14 @@ public class DataPipeline implements ProducerState, ConsumerState {
      */
     public long execute() throws StreamLoadException {
         // 1 个生产者 + N 个消费者
-        ExecutorService executor = Executors.newFixedThreadPool(1 + CONSUMER_THREADS);
+        int consumerThreads = properties.getConsumerThreads();
+        ExecutorService executor = Executors.newFixedThreadPool(1 + consumerThreads);
 
         Future<?> producerFuture = executor.submit(this::produce);
         
         // 启动多个消费者并行导入
-        Future<?>[] consumerFutures = new Future[CONSUMER_THREADS];
-        for (int i = 0; i < CONSUMER_THREADS; i++) {
+        Future<?>[] consumerFutures = new Future[consumerThreads];
+        for (int i = 0; i < consumerThreads; i++) {
             consumerFutures[i] = executor.submit(this::consume);
         }
 
@@ -182,7 +175,7 @@ public class DataPipeline implements ProducerState, ConsumerState {
             List<Map<String, Object>> batch = new ArrayList<>(properties.getBatchSize());
             int batchIndex = 0;
             long totalRecords = 0;
-            int checkInterval = 10000; // 每 10000 行检查一次消费者状态，减少 volatile 读
+            int checkInterval = properties.getConsumerCheckInterval();
 
             while (rs.next()) {
                 // 优化: 降低检查频率，从每行检查改为每 N 行检查一次
@@ -221,7 +214,8 @@ public class DataPipeline implements ProducerState, ConsumerState {
             }
 
             // 发送毒丸（每个消费者一个）
-            for (int i = 0; i < CONSUMER_THREADS; i++) {
+            int consumerThreads = properties.getConsumerThreads();
+            for (int i = 0; i < consumerThreads; i++) {
                 queue.put(POISON_PILL);
             }
             producerCompleted.set(true);
@@ -232,7 +226,8 @@ public class DataPipeline implements ProducerState, ConsumerState {
             producerCompleted.set(true);
             try {
                 // 发送多个毒丸确保所有消费者都能退出
-                for (int i = 0; i < CONSUMER_THREADS; i++) {
+                int consumerThreads = properties.getConsumerThreads();
+                for (int i = 0; i < consumerThreads; i++) {
                     queue.put(POISON_PILL);
                 }
             } catch (InterruptedException ignored) {
@@ -294,12 +289,13 @@ public class DataPipeline implements ProducerState, ConsumerState {
                         int failed = failedBatchCount.incrementAndGet();
                         log.error("消费者: 批次 {} 导入失败 (累计失败 {} 批): {}",
                                 batchData.getBatchIndex(), failed, result.getStatus());
-                        if (failed >= MAX_FAILED_BATCHES) {
+                        int maxFailedBatches = properties.getMaxFailedBatches();
+                        if (failed >= maxFailedBatches) {
                             consumerError.set(new StreamLoadException(
                                     String.format("失败批次达到 %d, 超过上限 %d, 停止导入",
-                                            failed, MAX_FAILED_BATCHES)));
+                                            failed, maxFailedBatches)));
                             consumerCompleted.set(true);
-                            log.error("失败批次达到 {} 个, 超过上限 {}, 停止导入", failed, MAX_FAILED_BATCHES);
+                            log.error("失败批次达到 {} 个, 超过上限 {}, 停止导入", failed, maxFailedBatches);
                             break;
                         }
                     }
@@ -307,12 +303,13 @@ public class DataPipeline implements ProducerState, ConsumerState {
                     int failed = failedBatchCount.incrementAndGet();
                     log.error("消费者: 批次 {} 异常 (累计失败 {} 批): {}",
                             batchData.getBatchIndex(), failed, e.getMessage(), e);
-                    if (failed >= MAX_FAILED_BATCHES) {
+                    int maxFailedBatches = properties.getMaxFailedBatches();
+                    if (failed >= maxFailedBatches) {
                         consumerError.set(new StreamLoadException(
                                 String.format("失败批次达到 %d, 超过上限 %d, 停止导入",
-                                        failed, MAX_FAILED_BATCHES)));
+                                        failed, maxFailedBatches)));
                         consumerCompleted.set(true);
-                        log.error("失败批次达到 {} 个, 超过上限 {}, 停止导入", failed, MAX_FAILED_BATCHES);
+                        log.error("失败批次达到 {} 个, 超过上限 {}, 停止导入", failed, maxFailedBatches);
                         break;
                     }
                 }

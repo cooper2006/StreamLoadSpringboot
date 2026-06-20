@@ -81,4 +81,34 @@ public class DorisProperties {
      * Doris MySQL 协议端口 (用于 JDBC 连接)
      */
     private int jdbcPort = 9030;
+    
+    /**
+     * Doris BE HTTP 端口 (用于重定向后直接访问 BE)
+     */
+    private int beHttpPort = 8040;
+    
+    /**
+     * 消费者线程数 (并行导入)
+     */
+    private int consumerThreads = 3;
+    
+    /**
+     * 生产者-消费者队列容量
+     */
+    private int queueCapacity = 8;
+    
+    /**
+     * 最大允许失败批次数
+     */
+    private int maxFailedBatches = 3;
+    
+    /**
+     * 断点保存间隔 (批次)
+     */
+    private int checkpointSaveInterval = 10;
+    
+    /**
+     * 消费者状态检查间隔 (行数)
+     */
+    private int consumerCheckInterval = 10000;
 }
