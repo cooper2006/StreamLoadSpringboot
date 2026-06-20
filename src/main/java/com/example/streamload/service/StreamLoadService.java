@@ -37,6 +37,8 @@ public class StreamLoadService {
     private final DorisProperties properties;
     private final CheckpointManager checkpointManager;
     private final ObjectMapper objectMapper;
+    // 优化: 预创建 ObjectWriter，避免每次序列化都重新配置
+    private final com.fasterxml.jackson.databind.ObjectWriter objectWriter;
     
     // 优化: 缓存 Base64 编码的认证信息，避免每次请求都重新计算
     private final String encodedAuth;
@@ -45,6 +47,8 @@ public class StreamLoadService {
         this.properties = properties;
         this.checkpointManager = checkpointManager;
         this.objectMapper = new ObjectMapper();
+        // 优化: 预创建 ObjectWriter，复用配置
+        this.objectWriter = objectMapper.writer();
         
         // 启用受限 HTTP头的支持，允许手动设置 Expect: 100-continue
         System.setProperty("sun.net.http.allowRestrictedHeaders", "true");
@@ -263,7 +267,8 @@ public class StreamLoadService {
      */
     private String convertToJson(List<Map<String, Object>> data) {
         try {
-            return objectMapper.writeValueAsString(data);
+            // 优化: 使用预创建的 ObjectWriter
+            return objectWriter.writeValueAsString(data);
         } catch (IOException e) {
             log.error("JSON 序列化失败", e);
             throw new RuntimeException("JSON 序列化失败", e);
