@@ -4,7 +4,7 @@ spring:
   
   datasource:
     # 源数据库配置 (MySQL)
-    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true
+    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
     username: root
     password: ServBay.dev
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -16,7 +16,7 @@ spring:
 # Doris Stream Load 配置
 doris:
   # Stream Load HTTP 地址 (使用 127.0.0.1 避免 IPv6 问题)
-  load-url: http://127.0.0.1:8030
+  load-url: http://127.0.0.1:18030
   # 目标数据库
   database: test_db
   # 认证信息 (根据实际环境修改)

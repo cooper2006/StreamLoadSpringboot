@@ -48,6 +48,11 @@ public class DorisProperties {
     private int timeout = 300;
     
     /**
+     * 连接超时时间 (秒)
+     */
+    private int connectTimeout = 60;
+    
+    /**
      * 最大重试次数
      */
     private int maxRetry = 3;
@@ -58,7 +63,22 @@ public class DorisProperties {
     private int retryIntervalBase = 2;
     
     /**
+     * 最大重定向次数
+     */
+    private int maxRedirects = 5;
+    
+    /**
+     * 最大过滤比例 (0-1)
+     */
+    private double maxFilterRatio = 0.1;
+    
+    /**
      * 断点续传文件路径
      */
     private String checkpointFile = "./checkpoint.json";
+    
+    /**
+     * Doris MySQL 协议端口 (用于 JDBC 连接)
+     */
+    private int jdbcPort = 9030;
 }

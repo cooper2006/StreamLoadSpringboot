@@ -18,7 +18,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.Proxy;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -38,9 +37,6 @@ public class StreamLoadService {
     private final DorisProperties properties;
     private final CheckpointManager checkpointManager;
     private final ObjectMapper objectMapper;
-    
-    // 缓存 307 重定向后的 BE 地址，避免每批都重定向
-    private volatile String cachedBeUrl = null;
     
     // 优化: 缓存 Base64 编码的认证信息，避免每次请求都重新计算
     private final String encodedAuth;
@@ -138,17 +134,16 @@ public class StreamLoadService {
     private LoadResult doLoad(String urlStr, String label, byte[] payload, boolean compressed, int recordCount)
             throws StreamLoadHttpException, StreamLoadIOException {
 
-        // 如果有缓存的 BE 地址，直接使用，避免 307 重定向
-        String currentUrl = cachedBeUrl != null ? cachedBeUrl : urlStr;
-        int maxRedirects = 5;
+        String currentUrl = urlStr;
+        int maxRedirects = properties.getMaxRedirects();
         int redirectCount = 0;
         
         while (redirectCount < maxRedirects) {
             HttpURLConnection conn = null;
             try {
                 URL url = new URL(currentUrl);
-                // 强制使用直连，绕过系统代理
-                conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+                // 使用默认代理配置，允许通过 Nginx 代理访问
+                conn = (HttpURLConnection) url.openConnection();
 
                 // 设置请求方法
                 conn.setRequestMethod("PUT");
@@ -157,16 +152,16 @@ public class StreamLoadService {
                 conn.setInstanceFollowRedirects(false);  // 禁用自动重定向，手动处理
 
                 // 设置超时
-                conn.setConnectTimeout(60 * 1000);  // 连接超时 60 秒
-                conn.setReadTimeout(properties.getTimeout() * 1000);  // 读取超时使用配置
+                conn.setConnectTimeout(properties.getConnectTimeout() * 1000);
+                conn.setReadTimeout(properties.getTimeout() * 1000);
 
                 // 设置请求头
                 conn.setRequestProperty("label", label);
                 conn.setRequestProperty("format", "json");
                 conn.setRequestProperty("strip_outer_array", "true");
                 conn.setRequestProperty("timeout", String.valueOf(properties.getTimeout()));
-                conn.setRequestProperty("max_filter_ratio", "0.1");  // 允许 10% 数据被过滤
-                conn.setRequestProperty("Expect", "100-continue");  // Doris 要求必须有这个头
+                conn.setRequestProperty("max_filter_ratio", String.valueOf(properties.getMaxFilterRatio()));
+                conn.setRequestProperty("Expect", "100-continue");  // Doris 要求必须有此头
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setRequestProperty("Content-Length", String.valueOf(payload.length));
 
@@ -191,12 +186,9 @@ public class StreamLoadService {
                     String location = conn.getHeaderField("Location");
                     if (location != null && !location.isEmpty()) {
                         log.debug("收到 307 重定向到: {}", location);
-                        // 处理 Docker 内部 IP，替换为可访问的地址
+                        // 处理 Docker 内部 IP，替换为 Nginx 代理地址
                         currentUrl = rewriteRedirectUrl(location);
                         log.debug("重写后的重定向 URL: {}", currentUrl);
-                        // 缓存 BE 地址，下次直接使用
-                        cachedBeUrl = currentUrl;
-                        log.debug("已缓存 BE 地址: {}", cachedBeUrl);
                         redirectCount++;
                         conn.disconnect();
                         continue;  // 继续循环，发送到新的 URL
@@ -301,20 +293,26 @@ public class StreamLoadService {
 
     /**
      * 重写重定向 URL，处理 Docker 内部 IP
-     * 将内部 IP 替换为 127.0.0.1，端口改为 8040（BE HTTP 端口）
+     * 在 Nginx 代理场景下，将重定向 URL 重写回 Nginx 代理地址
+     * 在直连场景下，将内部 IP 替换为 127.0.0.1，端口改为 8040（BE HTTP 端口）
      */
     private String rewriteRedirectUrl(String location) {
         try {
             URL redirectUrl = new URL(location);
             
-            // 如果重定向 URL 的主机是内部 IP，替换为 127.0.0.1
             String host = redirectUrl.getHost();
-            if (host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.")) {
-                // 使用 127.0.0.1 和 BE 的端口 8040
-                return String.format("%s://127.0.0.1:8040%s?%s",
+            boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
+            
+            if (isInternalIp) {
+                // 内部 IP 说明是 Docker 容器 IP，需要用宿主机映射端口直接访问 BE
+                // 无论在 Nginx 代理还是直连模式，都直接访问 127.0.0.1:8040（BE 的 HTTP 端口）
+                // 避免重新走 Nginx/FE 造成无限重定向循环
+                String rewritten = String.format("%s://127.0.0.1:8040%s?%s",
                         redirectUrl.getProtocol(),
                         redirectUrl.getPath(),
                         redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+                log.debug("内部 IP 重定向，重写为直接访问 BE: {}", rewritten);
+                return rewritten;
             }
             return location;
         } catch (Exception e) {

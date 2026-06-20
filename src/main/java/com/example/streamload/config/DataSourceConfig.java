@@ -2,6 +2,7 @@ package com.example.streamload.config;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -28,14 +29,8 @@ public class DataSourceConfig {
     @Value("${spring.datasource.driver-class-name}")
     private String mysqlDriverClassName;
 
-    @Value("${doris.load-url}")
-    private String dorisLoadUrl;
-
-    @Value("${doris.username}")
-    private String dorisUsername;
-
-    @Value("${doris.password}")
-    private String dorisPassword;
+    @Autowired
+    private DorisProperties dorisProperties;
 
     /**
      * 源数据库 (MySQL) - 用于读取数据
@@ -60,17 +55,20 @@ public class DataSourceConfig {
      */
     @Bean
     public DataSource dorisDataSource() {
-        // 从 load-url 提取主机和端口
-        // load-url 格式: http://127.0.0.1:8030
-        // Doris MySQL 协议端口: 9030
-        String dorisJdbcUrl = dorisLoadUrl
-                .replace("http://", "jdbc:mysql://")
-                .replace(":8030", ":9030") + "/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8";
+        // 从 load-url 提取主机
+        // load-url 格式: http://127.0.0.1:18030 (nginx 代理)
+        String host = dorisProperties.getLoadUrl()
+                .replace("http://", "")
+                .replace("https://", "")
+                .replaceAll(":\\d+", ""); // 移除端口部分
+        
+        String dorisJdbcUrl = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&allowPublicKeyRetrieval=true",
+                host, dorisProperties.getJdbcPort(), dorisProperties.getDatabase());
 
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl(dorisJdbcUrl);
-        config.setUsername(dorisUsername);
-        config.setPassword(dorisPassword);
+        config.setUsername(dorisProperties.getUsername());
+        config.setPassword(dorisProperties.getPassword());
         config.setDriverClassName("com.mysql.cj.jdbc.Driver");
         config.setMaximumPoolSize(3);
         config.setMinimumIdle(1);
