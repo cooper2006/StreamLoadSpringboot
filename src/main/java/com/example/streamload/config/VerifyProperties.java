@@ -38,6 +38,11 @@ public class VerifyProperties {
     private String verifyColumns;
     
     /**
+     * 抽样验证最大样本数
+     */
+    private int maxSampleSize = 1000;
+    
+    /**
      * 验证模式枚举
      */
     public enum VerifyMode {

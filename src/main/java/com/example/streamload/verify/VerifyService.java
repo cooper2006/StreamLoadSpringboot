@@ -71,7 +71,7 @@ public class VerifyService {
         if (param.getMode() == VerifyParam.VerifyMode.SAMPLE) {
             long targetCount = countTarget(param.getTargetTable());
             int sampleSize = Math.max(1, (int) (sourceCount * param.getSampleRatio()));
-            sampleSize = Math.min(sampleSize, 1000); // 上限 1000 条
+            sampleSize = Math.min(sampleSize, verifyProperties.getMaxSampleSize()); // 上限配置
 
             int matched = sampleVerify(param, sampleSize);
             return VerifyResult.sampleResult(sourceCount, targetCount, matched, sampleSize);

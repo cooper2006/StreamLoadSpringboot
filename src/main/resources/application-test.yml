@@ -41,6 +41,8 @@ verify:
   mode: COUNT
   # 抽样验证比例
   sample-ratio: 0.01
+  # 抽样验证最大样本数
+  max-sample-size: 1000
   # 源表查询 SQL (只导入 status=1 的数据)
   source-sql: "SELECT id, name, amount, status, created_at, description FROM test_source_table WHERE status = 1"
   # 目标表名称
