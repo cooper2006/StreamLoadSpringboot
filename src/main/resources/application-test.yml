@@ -34,6 +34,8 @@ doris:
   retry-interval-base: 2
   # 断点续传文件路径
   checkpoint-file: ./checkpoint-test.json
+  # 消费者线程数 (3 为最优配置，增加后性能反而下降)
+  consumer-threads: 3
 
 # 验证配置
 verify:
