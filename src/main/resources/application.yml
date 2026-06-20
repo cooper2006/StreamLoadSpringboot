@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: stream-load-doris
+  
+  datasource:
+    # 源数据库配置 (MySQL/PostgreSQL)
+    url: jdbc:mysql://localhost:3306/source_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    username: root
+    password: ServBay.dev
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 30000
+
+# Doris Stream Load 配置
+doris:
+  # Stream Load HTTP 地址
+  load-url: http://localhost:8030
+  # 目标数据库
+  database: target_db
+  # 认证信息
+  username: root
+  password: Root@123456
+  # 批次大小 (每批记录数)
+  batch-size: 100000
+  # 是否启用 gzip 压缩
+  enable-compression: true
+  # 超时时间 (秒)
+  timeout: 300
+  # 最大重试次数
+  max-retry: 3
+  # 重试间隔基数 (秒,指数退避)
+  retry-interval-base: 2
+  # 断点续传文件路径
+  checkpoint-file: ./checkpoint.json
+
+# 验证配置
+verify:
+  # 验证模式: NONE, COUNT, SAMPLE
+  mode: COUNT
+  # 抽样验证比例 (0-1)
+  sample-ratio: 0.01
+  # 源表查询 SQL
+  source-sql: "SELECT * FROM source_table WHERE status = 1"
+  # 目标表名称
+  target-table: target_table
+  # 验证字段 (用于抽样对比)
+  verify-columns: id,name,amount
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.example.streamload: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"

@@ -1,0 +1,22 @@
+# Compiled class files
+*.class
+
+# Log files
+*.log
+
+# Maven
+target/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Checkpoint files
+checkpoint-*.json

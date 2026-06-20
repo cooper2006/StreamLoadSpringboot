@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: stream-load-doris-test
+  
+  datasource:
+    # 源数据库配置 (MySQL)
+    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true
+    username: root
+    password: ServBay.dev
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 5
+      minimum-idle: 2
+      connection-timeout: 30000
+
+# Doris Stream Load 配置
+doris:
+  # Stream Load HTTP 地址 (使用 127.0.0.1 避免 IPv6 问题)
+  load-url: http://127.0.0.1:8030
+  # 目标数据库
+  database: test_db
+  # 认证信息 (根据实际环境修改)
+  username: root
+  password: Root@123456
+  # 批次大小 (300万数据建议 5万条/批，平衡内存和效率)
+  batch-size: 50000
+  # 启用 gzip 压缩（当前 Docker 环境不支持，关闭）
+  enable-compression: false
+  # 超时时间 (秒，大数据量适当增加)
+  timeout: 600
+  # 最大重试次数
+  max-retry: 3
+  # 重试间隔基数 (秒)
+  retry-interval-base: 2
+  # 断点续传文件路径
+  checkpoint-file: ./checkpoint-test.json
+
+# 验证配置
+verify:
+  # 验证模式: NONE, COUNT, SAMPLE
+  mode: COUNT
+  # 抽样验证比例
+  sample-ratio: 0.01
+  # 源表查询 SQL (只导入 status=1 的数据)
+  source-sql: "SELECT id, name, amount, status, created_at, description FROM test_source_table WHERE status = 1"
+  # 目标表名称
+  target-table: test_target_table
+  # 验证字段
+  verify-columns: id,name,amount
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.example.streamload: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss} [%thread] %-5level %logger{20} - %msg%n"
