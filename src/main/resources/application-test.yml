@@ -24,8 +24,8 @@ doris:
   # 认证信息 (根据实际环境修改)
   username: root
   password: Root@123456
-  # 批次大小 (5万条/批，平衡内存和效率)
-  batch-size: 50000
+  # 批次大小 (3万条/批，平衡内存和效率)，生产环境建议调整为 80000 条/批以提高性能
+  batch-size: 30000
   # 启用 gzip 压缩（当前 Docker 环境不支持，关闭）
   enable-compression: false
   # 超时时间 (秒，大数据量适当增加)
