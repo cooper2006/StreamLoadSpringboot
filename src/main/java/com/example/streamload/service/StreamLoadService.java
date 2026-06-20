@@ -145,11 +145,12 @@ public class StreamLoadService {
                 // 使用默认代理配置，允许通过 Nginx 代理访问
                 conn = (HttpURLConnection) url.openConnection();
 
-                // 设置请求方法
+                // 优化: 启用 HTTP Keep-Alive，复用连接提升吞吐量
                 conn.setRequestMethod("PUT");
                 conn.setDoOutput(true);
                 conn.setDoInput(true);
                 conn.setInstanceFollowRedirects(false);  // 禁用自动重定向，手动处理
+                conn.setUseCaches(false);
 
                 // 设置超时
                 conn.setConnectTimeout(properties.getConnectTimeout() * 1000);
@@ -177,6 +178,9 @@ public class StreamLoadService {
                     os.write(payload);
                     os.flush();
                 }
+                
+                // 优化: 立即读取响应，减少连接空闲时间
+                conn.getInputStream().close();
 
                 // 读取响应
                 int statusCode = conn.getResponseCode();
