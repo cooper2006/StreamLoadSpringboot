@@ -68,6 +68,10 @@ doris:
 | `enable-compression` | Nginx 代理下建议关闭 gzip 压缩，避免双重压缩问题 |
 | `timeout` | 大数据量导入时需适当增加超时时间 |
 | `batch-size` | 推荐 80000 条/批，兼顾吞吐和内存 |
+| `be-host` | 重定向重写目标主机地址，默认 `127.0.0.1` |
+| `be-http-port` | 重定向重写目标端口，默认 `8040` |
+| `docker-internal-ip-prefixes` | Docker 内部 IP 前缀列表，默认 `"172.,10.,192.168."` |
+| `docker-container-names` | Docker 容器名列表，默认 `"doris-be,doris-fe,doris"` |
 
 ## 重定向处理机制
 
@@ -81,35 +85,48 @@ Doris Stream Load 的工作流程如下：
 
 ### 解决方案
 
-代码中的 `rewriteRedirectUrl()` 方法会检测重定向目标是否为 Docker 内部 IP（`172.`、`10.`、`192.168.` 开头）或 Docker 容器名（`doris-be`），并将它们重写为 `127.0.0.1:8040` 直接访问 BE 的 Docker 映射端口，避免重定向循环。
+代码中的 `rewriteRedirectUrl()` 方法会检测重定向目标是否为 Docker 内部 IP 或 Docker 容器名（均可通过配置自定义），并将它们重写为可访问的 BE 地址，避免重定向循环。
 
 ```java
 /**
  * 重写重定向 URL，处理 Docker 内部 IP 和容器名
  * <p>
- * Doris Stream Load 流程：
- * 1. 客户端向 FE 发送导入请求（通过 Nginx 代理或直连）
- * 2. FE 返回 307 重定向，指向 BE 的地址（如 doris-be:8040 或 172.x.x.x:8040）
- * 3. 客户端需要跟随重定向，将数据直接发送到 BE
- * <p>
- * 注意：无论是否使用 Nginx 代理，重定向后都应直接访问 BE 的 Docker 映射端口 8040，
- * 避免将重定向 URL 重写回 Nginx 代理造成重定向循环。
+ * 可配置项（application.yml）：
+ * - doris.be-host: 重写目标主机地址，默认 127.0.0.1
+ * - doris.be-http-port: 重写目标端口，默认 8040
+ * - doris.docker-internal-ip-prefixes: 内部 IP 前缀列表，默认 "172.,10.,192.168."
+ * - doris.docker-container-names: 容器名列表，默认 "doris-be,doris-fe,doris"
  */
 private String rewriteRedirectUrl(String location) {
     try {
         URL redirectUrl = new URL(location);
-        
         String host = redirectUrl.getHost();
-        boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
-        boolean isDockerContainer = host.equalsIgnoreCase("doris-be") || 
-                                    host.equalsIgnoreCase("doris-fe") ||
-                                    host.contains("doris");
+        
+        // 从配置读取内部 IP 前缀列表
+        String[] internalIpPrefixes = properties.getDockerInternalIpPrefixes().split(",");
+        boolean isInternalIp = false;
+        for (String prefix : internalIpPrefixes) {
+            if (host.startsWith(prefix.trim())) {
+                isInternalIp = true;
+                break;
+            }
+        }
+        
+        // 从配置读取 Docker 容器名列表
+        String[] containerNames = properties.getDockerContainerNames().split(",");
+        boolean isDockerContainer = false;
+        for (String name : containerNames) {
+            if (host.equalsIgnoreCase(name.trim()) || host.contains(name.trim())) {
+                isDockerContainer = true;
+                break;
+            }
+        }
         
         if (isInternalIp || isDockerContainer) {
-            // 直接重写为 127.0.0.1:8040 访问 BE 的 Docker 映射端口
-            // 无论是否使用 Nginx 代理，重定向后都应直连 BE，避免重定向循环
-            String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
+            // 重写为配置的 BE 地址:端口
+            String rewritten = String.format("%s://%s:%d%s?%s",
                     redirectUrl.getProtocol(),
+                    properties.getBeHost(),
                     properties.getBeHttpPort(),
                     redirectUrl.getPath(),
                     redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
@@ -201,6 +218,7 @@ docker run -p 8040:8040 ... apache/doris:be-2.1.7
 - 确保使用最新版本的 `StreamLoadService.java`（`rewriteRedirectUrl` 方法支持 `doris-be` 容器名）
 - 确认 Docker 已暴露 BE 的 8040 端口
 - 检查日志中是否有 "Docker 内部地址重定向，重写为直接访问 BE" 的日志
+- 可通过 `doris.docker-container-names` 和 `doris.docker-internal-ip-prefixes` 自定义识别规则
 
 ### Q3: 验证失败，目标表记录数多于源表
 
