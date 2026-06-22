@@ -54,23 +54,35 @@ System.setProperty("sun.net.http.allowRestrictedHeaders", "true");
 
 **原因：** `Expect: 100-continue` 头被 JDK 默认为受限头，不允许手动设置。需要开启此属性。
 
-#### (3) 处理 Doris 307 重定向 + Docker 内网 IP 重写
+#### (3) 处理 Doris 307 重定向 + Docker 内网 IP 重写（支持 Nginx 代理）
 
-**问题：** Doris FE 返回 307 重定向到 BE 节点的内网 IP（`172.28.0.11:8040`），宿主机无法访问。
+**问题：** Doris FE 返回 307 重定向到 BE 节点的内网 IP（`172.28.0.11:8040`），宿主机无法访问。使用 Nginx 代理时，重定向 URL 需要重写回 Nginx 代理地址而非直连 BE。
 
 **修复方案：**
 ```java
 // 手动处理 307 重定向，禁用自动重定向
 conn.setInstanceFollowRedirects(false);
 
-// 重写重定向 URL：将 Docker 内网 IP 替换为宿主机可访问地址
+// 重写重定向 URL：自动检测代理模式
 private String rewriteRedirectUrl(String location) {
-    // 如果主机是 172./10./192.168. 开头的内网 IP
-    // 替换为 127.0.0.1:8040 (Docker 端口映射)
-    return String.format("%s://127.0.0.1:8040%s?%s",
-            redirectUrl.getProtocol(),
-            redirectUrl.getPath(),
-            redirectUrl.getQuery());
+    URL redirectUrl = new URL(location);
+    URL originalUrl = new URL(properties.getLoadUrl());
+    
+    // 通过端口判断是否为 Nginx 代理（标准 Doris FE 端口是 8030）
+    boolean isNginxProxy = originalUrl.getPort() != 8030 && originalUrl.getPort() != -1;
+    
+    if (isInternalIp) {
+        if (isNginxProxy) {
+            // Nginx 代理场景：重写回 Nginx 代理地址
+            return String.format("%s://%s:%d%s?%s",
+                    originalUrl.getProtocol(), originalUrl.getHost(),
+                    originalUrl.getPort(), redirectUrl.getPath(),
+                    redirectUrl.getQuery());
+        } else {
+            // 直连场景：使用 127.0.0.1 和 BE 端口 8040
+            return String.format("%s://127.0.0.1:8040%s?%s", ...);
+        }
+    }
 }
 ```
 
@@ -475,3 +487,7 @@ this.queue = new LinkedBlockingQueue<>(8);
 | 6 | 数据全部被过滤 | `max_filter_ratio=1.0` 导致 Doris 静默过滤所有数据 | 改为 `0.1` |
 | 7 | 验证查询连错数据库 | VerifyService 注入的是 MySQL 而非 Doris 数据源 | 创建独立 Doris 数据源 + `@Qualifier` 注入 |
 | 8 | gzip 压缩导入失败 | `compress: gzip` 头 Doris 未识别；Docker 版不支持 gzip | 暂关闭压缩，保留正确压缩头 |
+| 9 | Nginx 代理下 100-continue 头丢失 | Nginx 默认消费 `Expect: 100-continue` 头不转发 | Nginx 配置添加 `proxy_set_header Expect $http_expect;` |
+| 10 | Nginx 代理下 307 重定向死循环 | 代码将 307 重写回 Nginx，Nginx 又转发到 FE，FE 又 307 | `rewriteRedirectUrl` 自动检测代理模式，重写回 Nginx 代理地址 |
+| 11 | Doris JDBC 连接超时（Nginx 代理端口） | `dorisDataSource` 用 `replace(":8030", ":9030")` 推导 JDBC URL，代理端口非 8030 时失败 | 改为提取主机名 + 固定端口 9030 |
+| 12 | MySQL `Public Key Retrieval is not allowed` | JDBC URL 缺少 `allowPublicKeyRetrieval=true` | 添加该参数 |

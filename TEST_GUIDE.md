@@ -50,16 +50,51 @@ source scripts/init_doris_table.sql
 ```yaml
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/test_db
-    username: root          # 修改为你的 MySQL 用户名
-    password: root          # 修改为你的 MySQL 密码
+    # MySQL 连接配置
+    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
+    username: root
+    password: your_mysql_password  # 修改为你的 MySQL 密码
 
 doris:
-  load-url: http://localhost:8030  # Doris FE HTTP 地址
+  # Doris Stream Load HTTP 地址
+  # 直连模式：http://127.0.0.1:8030
+  # Nginx 代理模式：http://127.0.0.1:18030（自动检测代理模式）
+  load-url: http://127.0.0.1:8030
   database: test_db
-  username: root            # Doris 用户名
-  password: ""              # Doris 密码
+  username: root
+  password: your_doris_password  # 修改为你的 Doris 密码
+  
+  # 批次大小（每批记录数）
+  # 建议值：
+  # - 小数据量（< 100 万）：50000
+  # - 大数据量（> 100 万）：50000-100000
+  batch-size: 50000
+  
+  # 是否启用 gzip 压缩
+  # 注意：Doris 2.1.7 Docker 版不支持 gzip，需设置为 false
+  enable-compression: false
+  
+  # 超时时间（秒）
+  timeout: 600
+  
+  # 最大重试次数
+  max-retry: 3
 ```
+
+**Nginx 代理配置（可选）：**
+
+如果使用 Nginx 代理 Doris，需要在 Nginx 配置中添加：
+
+```nginx
+location / {
+    proxy_pass http://doris_fe;
+    proxy_set_header Expect $http_expect;  # 转发 Expect 头给 Doris
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+程序会自动检测代理模式（通过端口判断），正确处理 307 重定向。
 
 ### 4. 运行程序
 
@@ -203,20 +238,35 @@ FROM (SELECT @rownum := @rownum + 1 AS seq FROM
 
 1. **批次大小**
    - 小数据量（< 100 万）：`batch-size: 50000`
-   - 大数据量（> 100 万）：`batch-size: 100000`
+   - 大数据量（> 100 万）：`batch-size: 50000`（推荐，平衡内存和效率）
+   - 超大批次（> 500 万）：可尝试 `batch-size: 100000`（需监控内存）
 
 2. **压缩**
-   - 网络带宽有限：启用压缩（默认）
-   - 本地网络：可关闭压缩减少 CPU 开销
+   - 网络带宽有限：启用压缩（如果 Doris 支持）
+   - 本地网络或 Docker 环境：关闭压缩减少 CPU 开销
+   - 注意：Doris 2.1.7 Docker 版不支持 gzip，需设置 `enable-compression: false`
 
 3. **并发**
-   - 当前版本单线程导入
+   - 当前版本支持 3 个消费者线程并行导入
    - 可通过多实例并行导入不同表
+   - 生产者-消费者模式，队列容量 8，平衡内存和吞吐量
 
 4. **JVM 参数**
    ```bash
    java -Xms1g -Xmx2g -jar target/stream-load-doris-1.0.0.jar
    ```
+
+5. **失败批次控制**
+   - 默认超过 3 批失败自动停止，避免无效重试
+   - 如需调整，修改 `DataPipeline.java` 中的 `MAX_FAILED_BATCHES` 常量
+
+### 性能数据参考
+
+| 数据量 | 耗时 | 吞吐量 | 内存峰值 |
+|--------|------|--------|----------|
+| 315 万条 | 14 秒 | 225,145 条/秒 | ~250MB |
+| 100 万条 | ~4.5 秒 | ~222,000 条/秒 | ~200MB |
+| 10 万条 | ~0.5 秒 | ~200,000 条/秒 | ~150MB |
 
 ## 清理测试数据
 

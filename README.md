@@ -11,7 +11,8 @@
 - **自动重试**：失败批次自动重试（最多3次），指数退避策略
 - **实时进度**：每5秒输出导入进度和统计信息
 - **数据验证**：导入完成后自动验证源表和目标表数据一致性
-- **307重定向缓存**：缓存 BE 节点地址，减少 HTTP 连接开销
+- **Nginx 代理支持**：自动检测代理模式，正确处理 307 重定向
+- **失败批次控制**：超过 3 批失败自动停止，避免无效重试
 
 ## 技术栈
 
@@ -70,17 +71,47 @@ source scripts/init_doris_table.sql
 ```yaml
 spring:
   datasource:
-    url: jdbc:mysql://127.0.0.1:3306/test_db
+    # MySQL 连接配置
+    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
     username: root
-    password: your_password  # 修改为你的密码
+    password: your_mysql_password  # 修改为你的 MySQL 密码
 
 doris:
+  # Doris Stream Load HTTP 地址
+  # 直连模式：http://127.0.0.1:8030
+  # Nginx 代理模式：http://127.0.0.1:18030（自动检测代理模式）
   load-url: http://127.0.0.1:8030
   database: test_db
   username: root
   password: your_doris_password  # 修改为你的 Doris 密码
-  batch-size: 50000  # 每批导入条数
+  
+  # 批次大小（每批记录数）
+  batch-size: 50000
+  
+  # 是否启用 gzip 压缩
+  # 注意：Doris 2.1.7 Docker 版不支持 gzip，需设置为 false
+  enable-compression: false
+  
+  # 超时时间（秒）
+  timeout: 600
+  
+  # 最大重试次数
+  max-retry: 3
 ```
+
+**Nginx 代理配置（可选）：**
+
+如果使用 Nginx 代理 Doris，需要在 Nginx 配置中添加：
+
+```nginx
+location / {
+    proxy_pass http://doris_fe;
+    proxy_set_header Expect $http_expect;  # 转发 Expect 头给 Doris
+    proxy_set_header Host $host;
+}
+```
+
+程序会自动检测代理模式（通过端口判断），正确处理 307 重定向。
 
 ### 6. 运行导入
 

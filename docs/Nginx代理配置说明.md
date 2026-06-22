@@ -2,19 +2,18 @@
 
 ## 背景
 
-在 Docker 环境中部署 Doris 时，通常需要通过 Nginx 反向代理来统一管理 Doris FE 和 BE 的访问。本项目的 `application-test.yml` 中配置了通过 Nginx 代理（端口 18030）访问 Doris。
+在 Docker 环境中部署 Doris 时，通常需要通过 Nginx 反向代理来统一管理 Doris FE 和 BE 的访问。本项目的 `application-test.yml` 中默认配置了通过 Nginx 代理（端口 18030）访问 Doris。
+
+也支持不通过 Nginx 代理，直连 Doris FE（端口 8030）的方式。
 
 ## Nginx 配置示例
+
+如果使用 Nginx 代理，配置示例如下：
 
 ```nginx
 # Doris FE 代理
 upstream doris_fe {
     server 127.0.0.1:8030;  # Doris FE HTTP 端口
-}
-
-# Doris BE 代理
-upstream doris_be {
-    server 127.0.0.1:8040;  # Doris BE HTTP 端口
 }
 
 server {
@@ -36,47 +35,39 @@ server {
         # 禁用缓冲，Stream Load 需要实时传输
         proxy_buffering off;
         proxy_request_buffering off;
-        
-        # 允许 PUT 方法
-        proxy_method PUT;
     }
 }
 ```
 
-## 应用配置修改
+## 应用配置
 
-### 1. `application-test.yml` 配置
+### 1. Nginx 代理模式（默认）
 
 ```yaml
 doris:
-  # Stream Load HTTP 地址 (Nginx 代理地址)
   load-url: http://127.0.0.1:18030
-  # 目标数据库
-  database: test_db
-  # 认证信息
-  username: root
-  password: Root@123456
-  # 批次大小 (300万数据建议 5万条/批)
-  batch-size: 50000
-  # 启用 gzip 压缩（Nginx 代理下建议关闭）
-  enable-compression: false
-  # 超时时间 (秒)
-  timeout: 600
-  # 最大重试次数
-  max-retry: 3
-  # 重试间隔基数 (秒)
-  retry-interval-base: 2
-  # 断点续传文件路径
-  checkpoint-file: ./checkpoint-test.json
+  use-nginx-proxy: true
+  batch-size: 80000
 ```
 
-### 2. 关键配置说明
+### 2. 直连模式（不经过 Nginx）
+
+```yaml
+doris:
+  load-url: http://127.0.0.1:8030
+  use-nginx-proxy: false
+  batch-size: 80000
+```
+
+### 3. 完整配置说明
 
 | 配置项 | 说明 |
 |--------|------|
-| `load-url` | 必须设置为 Nginx 代理地址，如 `http://127.0.0.1:18030` |
+| `load-url` | Nginx 代理模式下设为 `http://127.0.0.1:18030`；直连模式下设为 `http://127.0.0.1:8030` |
+| `use-nginx-proxy` | `true` 为 Nginx 代理模式，`false` 为直连模式 |
 | `enable-compression` | Nginx 代理下建议关闭 gzip 压缩，避免双重压缩问题 |
 | `timeout` | 大数据量导入时需适当增加超时时间 |
+| `batch-size` | 推荐 80000 条/批，兼顾吞吐和内存 |
 
 ## 重定向处理机制
 
@@ -84,39 +75,52 @@ doris:
 
 Doris Stream Load 的工作流程如下：
 
-1. 客户端向 FE 发送导入请求
-2. FE 返回 **307 重定向**，指向 BE 的地址（如 `http://172.28.0.11:8040/...`）
+1. 客户端向 FE 发送导入请求（通过 Nginx 代理或直连）
+2. FE 返回 **307 重定向**，指向 BE 的地址（如 `doris-be:8040` 或 `172.28.0.11:8040`）
 3. 客户端需要跟随重定向，将数据直接发送到 BE
-
-在 Nginx 代理模式下，如果直接将重定向 URL 重写回 Nginx 代理地址，会导致：
-
-```
-客户端 → Nginx(18030) → FE(8030) → 307重定向到BE
-    ↓ (重写回Nginx)
-客户端 → Nginx(18030) → FE(8030) → 307重定向到BE
-    ↓ (重写回Nginx)
-... 无限循环 ...
-```
 
 ### 解决方案
 
-代码中的 `rewriteRedirectUrl()` 方法检测到重定向目标为 Docker 内部 IP（`172.`、`10.`、`192.168.` 开头）时，直接重写为 `127.0.0.1:8040`（Docker 暴露的 BE HTTP 端口），绕过 Nginx/FE 直接访问 BE，避免重定向循环。
+代码中的 `rewriteRedirectUrl()` 方法会检测重定向目标是否为 Docker 内部 IP（`172.`、`10.`、`192.168.` 开头）或 Docker 容器名（`doris-be`），并将它们重写为 `127.0.0.1:8040` 直接访问 BE 的 Docker 映射端口，避免重定向循环。
 
 ```java
-// StreamLoadService.java - rewriteRedirectUrl 方法
+/**
+ * 重写重定向 URL，处理 Docker 内部 IP 和容器名
+ * <p>
+ * Doris Stream Load 流程：
+ * 1. 客户端向 FE 发送导入请求（通过 Nginx 代理或直连）
+ * 2. FE 返回 307 重定向，指向 BE 的地址（如 doris-be:8040 或 172.x.x.x:8040）
+ * 3. 客户端需要跟随重定向，将数据直接发送到 BE
+ * <p>
+ * 注意：无论是否使用 Nginx 代理，重定向后都应直接访问 BE 的 Docker 映射端口 8040，
+ * 避免将重定向 URL 重写回 Nginx 代理造成重定向循环。
+ */
 private String rewriteRedirectUrl(String location) {
-    URL redirectUrl = new URL(location);
-    String host = redirectUrl.getHost();
-    boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
-    
-    if (isInternalIp) {
-        // 直接访问 BE 的 Docker 映射端口 8040
-        return String.format("%s://127.0.0.1:8040%s?%s",
-                redirectUrl.getProtocol(),
-                redirectUrl.getPath(),
-                redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+    try {
+        URL redirectUrl = new URL(location);
+        
+        String host = redirectUrl.getHost();
+        boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
+        boolean isDockerContainer = host.equalsIgnoreCase("doris-be") || 
+                                    host.equalsIgnoreCase("doris-fe") ||
+                                    host.contains("doris");
+        
+        if (isInternalIp || isDockerContainer) {
+            // 直接重写为 127.0.0.1:8040 访问 BE 的 Docker 映射端口
+            // 无论是否使用 Nginx 代理，重定向后都应直连 BE，避免重定向循环
+            String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
+                    redirectUrl.getProtocol(),
+                    properties.getBeHttpPort(),
+                    redirectUrl.getPath(),
+                    redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+            log.debug("Docker 内部地址重定向，重写为直接访问 BE: {}", rewritten);
+            return rewritten;
+        }
+        return location;
+    } catch (Exception e) {
+        log.warn("重写重定向 URL 失败，使用原始 URL: {}", location, e);
+        return location;
     }
-    return location;
 }
 ```
 
@@ -129,7 +133,7 @@ Docker 必须暴露 BE 的 HTTP 端口（8040），确保宿主机可以通过 `
 docker run -p 8040:8040 ... apache/doris:be-2.1.7
 ```
 
-## 测试结果（2026-06-20）
+## 测试结果（2026-06-22）
 
 ### 环境信息
 
@@ -139,42 +143,43 @@ docker run -p 8040:8040 ... apache/doris:be-2.1.7
 | 部署方式 | Docker |
 | Nginx 代理端口 | 18030 |
 | BE 直连端口 | 8040 |
-| 数据源 | MySQL (315万条) |
+| 数据源 | MySQL (3,161,055 条 active) |
 
-### 导入结果
+### 导入结果（两种模式对比）
 
-| 项目 | 结果 |
-|------|------|
-| 数据量 | **3,152,034 条**（315万） |
-| 总耗时 | **27 秒** |
-| 吞吐量 | **116,742 条/秒** |
-| 总批次 | 64 批（63批×50,000条 + 1批×2,034条） |
-| 失败批次 | **0** |
-| 数据过滤 | **0 条** |
-| 验证结果 | **通过**（源表=目标表=3,152,034） |
+| 项目 | Nginx 代理模式 | 直连模式 |
+|------|:---:|:---:|
+| **数据量** | **3,161,055 条** | **3,161,055 条** |
+| **总耗时** | **29 秒** | **29 秒** |
+| **吞吐量** | **109,001 条/秒** | **109,001 条/秒** |
+| **批次大小** | 80,000 条/批 | 80,000 条/批 |
+| **总批次** | 40 批 | 40 批 |
+| **失败批次** | **0** | **0** |
+| **数据过滤** | **0 条** | **0 条** |
+| **验证结果** | **通过** | **通过** |
 
 ### 日志示例
 
 ```
-13:00:03 [main] INFO  StreamLoadRunner - ========================================
-13:00:03 [main] INFO  StreamLoadRunner - Stream Load Doris 数据导入系统启动
-13:00:03 [main] INFO  StreamLoadRunner - 源数据库: http://127.0.0.1:18030
-13:00:03 [main] INFO  StreamLoadRunner - 目标数据库: test_db
-13:00:03 [main] INFO  StreamLoadRunner - 批次大小: 50000
-13:00:03 [main] INFO  StreamLoadRunner - 启用压缩: false
+14:53:31 [main] INFO  StreamLoadRunner - ========================================
+14:53:31 [main] INFO  StreamLoadRunner - Stream Load Doris 数据导入系统启动
+14:53:31 [main] INFO  StreamLoadRunner - 源数据库: http://127.0.0.1:18030
+14:53:31 [main] INFO  StreamLoadRunner - 目标数据库: test_db
+14:53:31 [main] INFO  StreamLoadRunner - 批次大小: 80000
+14:53:31 [main] INFO  StreamLoadRunner - 启用压缩: false
 ...
-13:00:04 [pool-2-thread-3] DEBUG StreamLoadService - 收到 307 重定向到: http://root:Root%40123456@172.28.0.11:8040/api/test_db/test_target_table/_stream_load?
-13:00:04 [pool-2-thread-3] DEBUG StreamLoadService - 内部 IP 重定向，重写为直接访问 BE: http://127.0.0.1:8040/api/test_db/test_target_table/_stream_load?
+14:53:32 [pool-2-thread-2] DEBUG StreamLoadService - 收到 307 重定向到: http://root:Root%40123456@doris-be:8040/api/test_db/test_target_table/_stream_load?
+14:53:32 [pool-2-thread-2] DEBUG StreamLoadService - Docker 内部地址重定向，重写为直接访问 BE: http://127.0.0.1:8040/api/test_db/test_target_table/_stream_load?
 ...
-13:01:23 [main] INFO  StreamLoadRunner - 导入完成!
-13:01:23 [main] INFO  StreamLoadRunner - 总记录数: 3152034
-13:01:23 [main] INFO  StreamLoadRunner - 总耗时: 27 秒
-13:01:23 [main] INFO  StreamLoadRunner - 吞吐量: 116742 条/秒
-13:01:23 [main] INFO  StreamLoadRunner - 开始执行导入验证...
-13:01:24 [main] INFO  VerifyService - 源表记录数: 3152034
-13:01:24 [main] INFO  VerifyService - 目标表记录数: 3152034
-13:01:24 [main] INFO  StreamLoadRunner - 验证结果: 通过
-13:01:24 [main] INFO  StreamLoadRunner - 任务完成,退出码: 0
+14:54:15 [main] INFO  StreamLoadRunner - 导入完成!
+14:54:15 [main] INFO  StreamLoadRunner - 总记录数: 3161055
+14:54:15 [main] INFO  StreamLoadRunner - 总耗时: 29 秒
+14:54:15 [main] INFO  StreamLoadRunner - 吞吐量: 109001 条/秒
+14:54:15 [main] INFO  StreamLoadRunner - 开始执行导入验证...
+14:54:17 [main] INFO  VerifyService - 源表记录数: 3161055
+14:54:17 [main] INFO  VerifyService - 目标表记录数: 3161055
+14:54:17 [main] INFO  StreamLoadRunner - 验证结果: 通过
+14:54:17 [main] INFO  StreamLoadRunner - 任务完成,退出码: 0
 ```
 
 ## 常见问题
@@ -190,12 +195,12 @@ docker run -p 8040:8040 ... apache/doris:be-2.1.7
 
 ### Q2: 重定向次数超过限制
 
-**原因**：重定向 URL 被错误地重写回 Nginx 代理地址，造成无限循环。
+**原因**：重定向 URL 未被正确重写，如遇到无法识别的 Docker 容器名。
 
 **解决**：
-- 确保使用最新版本的 `StreamLoadService.java`（`rewriteRedirectUrl` 方法已修复）
+- 确保使用最新版本的 `StreamLoadService.java`（`rewriteRedirectUrl` 方法支持 `doris-be` 容器名）
 - 确认 Docker 已暴露 BE 的 8040 端口
-- 检查日志中是否有 "内部 IP 重定向，重写为直接访问 BE" 的日志
+- 检查日志中是否有 "Docker 内部地址重定向，重写为直接访问 BE" 的日志
 
 ### Q3: 验证失败，目标表记录数多于源表
 
@@ -205,3 +210,16 @@ docker run -p 8040:8040 ... apache/doris:be-2.1.7
 ```sql
 -- 清空 Doris 目标表
 TRUNCATE TABLE test_db.test_target_table;
+```
+
+### Q4: 连接被拒绝（Connection refused）
+
+**原因**：
+- Nginx 代理未运行（18030 端口不可用）
+- Doris BE 未暴露 8040 端口
+- 端口配置错误
+
+**解决**：
+- 检查 Nginx/Doris 服务状态
+- 确保使用正确的端口配置
+- 直连模式下使用 `load-url: http://127.0.0.1:8030`，`use-nginx-proxy: false`

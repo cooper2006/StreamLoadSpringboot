@@ -298,7 +298,15 @@ public class StreamLoadService {
     }
 
     /**
-     * 重写重定向 URL，处理 Docker 内部 IP
+     * 重写重定向 URL，处理 Docker 内部 IP 和容器名
+     * <p>
+     * Doris Stream Load 流程：
+     * 1. 客户端向 FE 发送导入请求（通过 Nginx 代理或直连）
+     * 2. FE 返回 307 重定向，指向 BE 的地址（如 doris-be:8040 或 172.x.x.x:8040）
+     * 3. 客户端需要跟随重定向，将数据直接发送到 BE
+     * <p>
+     * 注意：无论是否使用 Nginx 代理，重定向后都应直接访问 BE 的 Docker 映射端口 8040，
+     * 避免将重定向 URL 重写回 Nginx 代理造成重定向循环。
      * 
      * @param location 重定向 URL
      * @return 处理后的 URL
@@ -309,16 +317,19 @@ public class StreamLoadService {
             
             String host = redirectUrl.getHost();
             boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
+            boolean isDockerContainer = host.equalsIgnoreCase("doris-be") || 
+                                        host.equalsIgnoreCase("doris-fe") ||
+                                        host.contains("doris");
             
-            if (isInternalIp) {
-                // 无论是 Nginx 代理还是直连，遇到内部 IP 都需要重写为 127.0.0.1:8040
-                // 因为宿主机无法直接访问 Docker 容器内部 IP
+            if (isInternalIp || isDockerContainer) {
+                // 直接重写为 127.0.0.1:8040 访问 BE 的 Docker 映射端口
+                // 无论是否使用 Nginx 代理，重定向后都应直连 BE，避免重定向循环
                 String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
                         redirectUrl.getProtocol(),
                         properties.getBeHttpPort(),
                         redirectUrl.getPath(),
                         redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
-                log.debug("检测到内部 IP，重写为直接访问 BE: {}", rewritten);
+                log.debug("Docker 内部地址重定向，重写为直接访问 BE: {}", rewritten);
                 return rewritten;
             }
             return location;
