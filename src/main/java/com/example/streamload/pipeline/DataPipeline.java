@@ -2,6 +2,7 @@ package com.example.streamload.pipeline;
 
 import com.example.streamload.config.DorisProperties;
 import com.example.streamload.exception.StreamLoadException;
+import com.example.streamload.exception.StreamLoadIOException;
 import com.example.streamload.service.StreamLoadService;
 import com.example.streamload.state.ConsumerState;
 import com.example.streamload.state.ProducerState;
@@ -76,51 +77,63 @@ public class DataPipeline implements ProducerState, ConsumerState {
      * @return 导入的总记录数
      */
     public long execute() throws StreamLoadException {
-        // 1 个生产者 + N 个消费者
         int consumerThreads = properties.getConsumerThreads();
         ExecutorService executor = Executors.newFixedThreadPool(1 + consumerThreads);
-
-        Future<?> producerFuture = executor.submit(this::produce);
-        
-        // 启动多个消费者并行导入
-        Future<?>[] consumerFutures = new Future[consumerThreads];
-        for (int i = 0; i < consumerThreads; i++) {
-            consumerFutures[i] = executor.submit(this::consume);
-        }
-
-        executor.shutdown();
-
+        boolean success = false;
         try {
-            // 等待生产者完成
-            producerFuture.get();
-            // 等待所有消费者完成
-            for (Future<?> future : consumerFutures) {
-                future.get();
+            Future<?> producerFuture = executor.submit(this::produce);
+
+            Future<?>[] consumerFutures = new Future[consumerThreads];
+            for (int i = 0; i < consumerThreads; i++) {
+                consumerFutures[i] = executor.submit(this::consume);
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new com.example.streamload.exception.StreamLoadIOException("流水线被中断", e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof StreamLoadException) {
-                throw (StreamLoadException) cause;
+
+            executor.shutdown();
+
+            try {
+                producerFuture.get();
+                for (Future<?> future : consumerFutures) {
+                    future.get();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new com.example.streamload.exception.StreamLoadIOException("流水线被中断", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof StreamLoadException) {
+                    throw (StreamLoadException) cause;
+                }
+                throw new com.example.streamload.exception.StreamLoadIOException("流水线执行异常", cause);
             }
-            throw new com.example.streamload.exception.StreamLoadIOException("流水线执行异常", cause);
-        }
 
-        // 检查生产者异常
-        if (producerError.get() != null) {
-            throw new com.example.streamload.exception.StreamLoadIOException(
-                    "生产者异常: " + producerError.get().getMessage(), producerError.get());
-        }
+            if (producerError.get() != null) {
+                throw new com.example.streamload.exception.StreamLoadIOException(
+                        "生产者异常: " + producerError.get().getMessage(), producerError.get());
+            }
 
-        // 检查消费者异常
-        if (consumerError.get() != null) {
-            throw new com.example.streamload.exception.StreamLoadIOException(
-                    "消费者异常: " + consumerError.get().getMessage(), consumerError.get());
-        }
+            if (consumerError.get() != null) {
+                throw new com.example.streamload.exception.StreamLoadIOException(
+                        "消费者异常: " + consumerError.get().getMessage(), consumerError.get());
+            }
 
-        return importedRecordCount.get();
+            success = true;
+            return importedRecordCount.get();
+        } finally {
+            if (!executor.isTerminated()) {
+                try {
+                    if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                        log.warn("线程池等待终止超时,强制关闭");
+                        executor.shutdownNow();
+                        if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                            log.error("线程池强制关闭仍超时");
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    executor.shutdownNow();
+                }
+            }
+        }
     }
 
     /**
@@ -201,7 +214,10 @@ public class DataPipeline implements ProducerState, ConsumerState {
                         log.info("生产者: 批次 {} 已入队, 累计 {} 条", batchIndex, producedRecordCount.get());
                     }
                     BatchData batchData = new BatchData(batchIndex, new ArrayList<>(batch));
-                    queue.put(batchData); // 阻塞等待消费者取走
+                    // 使用带超时的 offer 替代 put，防止消费者失败时生产者永久阻塞
+                    if (!queue.offer(batchData, 30, TimeUnit.SECONDS)) {
+                        throw new StreamLoadIOException("队列写入超时,消费者可能已停止工作");
+                    }
                     producedBatchCount.incrementAndGet();
                     producedRecordCount.addAndGet(batch.size());
                     batch.clear();
@@ -212,7 +228,9 @@ public class DataPipeline implements ProducerState, ConsumerState {
             // 处理最后一批
             if (!batch.isEmpty()) {
                 BatchData batchData = new BatchData(batchIndex, new ArrayList<>(batch));
-                queue.put(batchData);
+                if (!queue.offer(batchData, 30, TimeUnit.SECONDS)) {
+                    throw new StreamLoadIOException("队列写入超时,消费者可能已停止工作");
+                }
                 producedBatchCount.incrementAndGet();
                 producedRecordCount.addAndGet(batch.size());
                 log.info("生产者: 最后一批 {} 已入队, 累计 {} 条", batchIndex, producedRecordCount.get());
@@ -221,7 +239,9 @@ public class DataPipeline implements ProducerState, ConsumerState {
             // 发送毒丸（每个消费者一个）
             int consumerThreads = properties.getConsumerThreads();
             for (int i = 0; i < consumerThreads; i++) {
-                queue.put(POISON_PILL);
+                if (!queue.offer(POISON_PILL, 30, TimeUnit.SECONDS)) {
+                    throw new StreamLoadIOException("发送毒丸超时");
+                }
             }
             producerCompleted.set(true);
             log.info("生产者完成: 共 {} 批次, {} 条记录", producedBatchCount.get(), producedRecordCount.get());
@@ -230,13 +250,17 @@ public class DataPipeline implements ProducerState, ConsumerState {
             producerError.set(e);
             producerCompleted.set(true);
             try {
-                // 发送多个毒丸确保所有消费者都能退出
                 int consumerThreads = properties.getConsumerThreads();
                 for (int i = 0; i < consumerThreads; i++) {
-                    queue.put(POISON_PILL);
+                    try {
+                        queue.offer(POISON_PILL, 5, TimeUnit.SECONDS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+            } catch (Exception ignored) {
+                // ignore
             }
             log.error("生产者异常: {}", e.getMessage(), e);
         } finally {

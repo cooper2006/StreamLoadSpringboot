@@ -11,6 +11,7 @@ import com.example.streamload.verify.VerifyResult;
 import com.example.streamload.verify.VerifyService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.ExitCodeGenerator;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
@@ -22,7 +23,7 @@ import javax.sql.DataSource;
  */
 @Slf4j
 @Component
-public class StreamLoadRunner implements CommandLineRunner {
+public class StreamLoadRunner implements CommandLineRunner, ExitCodeGenerator {
 
     private final JdbcTemplate jdbcTemplate;
     private final StreamLoadService streamLoadService;
@@ -31,6 +32,7 @@ public class StreamLoadRunner implements CommandLineRunner {
     private final VerifyService verifyService;
     private final CheckpointManager checkpointManager;
     private final DataSource dataSource;
+    private int exitCode = 0;
 
     public StreamLoadRunner(JdbcTemplate jdbcTemplate,
                             StreamLoadService streamLoadService,
@@ -96,7 +98,7 @@ public class StreamLoadRunner implements CommandLineRunner {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-            });
+            }, "progress-monitor");
             progressThread.setDaemon(true);
             progressThread.start();
 
@@ -122,24 +124,32 @@ public class StreamLoadRunner implements CommandLineRunner {
 
                 if (!verifyResult.isPassed()) {
                     log.error("导入验证失败,请检查数据!");
-                    System.exit(1);
+                    exitCode = 1;
                 }
             }
 
             // 清除断点 (导入成功完成后)
             checkpointManager.clearCheckpoint();
 
-            log.info("任务完成,退出码: 0");
-            System.exit(0);
-
         } catch (StreamLoadException e) {
             log.error("导入失败: {}", e.getMessage(), e);
-            log.info("任务失败,退出码: 1");
-            System.exit(1);
+            checkpointManager.forceSave();
+            exitCode = 1;
         } catch (Exception e) {
             log.error("未知错误: {}", e.getMessage(), e);
-            log.info("任务失败,退出码: 2");
-            System.exit(2);
+            checkpointManager.forceSave();
+            exitCode = 2;
+        } finally {
+            if (exitCode != 0) {
+                log.info("任务失败,退出码: {}", exitCode);
+            } else {
+                log.info("任务完成,退出码: 0");
+            }
         }
+    }
+
+    @Override
+    public int getExitCode() {
+        return exitCode;
     }
 }

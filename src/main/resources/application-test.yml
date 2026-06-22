@@ -4,9 +4,9 @@ spring:
   
   datasource:
     # 源数据库配置 (MySQL)
-    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
-    username: root
-    password: ServBay.dev
+    url: ${MYSQL_URL:jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true}
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 5
@@ -18,12 +18,12 @@ doris:
   # Stream Load HTTP 地址
   # 开发环境：通过 Nginx 代理 (18030)
   # 生产环境：直接连接 Doris FE (8030)
-  load-url: http://127.0.0.1:18030
+  load-url: ${DORIS_LOAD_URL:http://127.0.0.1:8030}
   # 目标数据库
-  database: test_db
+  database: ${DORIS_DATABASE:test_db}
   # 认证信息 (根据实际环境修改)
-  username: root
-  password: Root@123456
+  username: ${DORIS_USERNAME:root}
+  password: ${DORIS_PASSWORD}
   # 批次大小 (3万条/批，平衡内存和效率)，生产环境建议调整为 80000 条/批以提高性能
   batch-size: 80000
   # 启用 gzip 压缩（当前 Docker 环境不支持，关闭）

@@ -491,3 +491,190 @@ this.queue = new LinkedBlockingQueue<>(8);
 | 10 | Nginx 代理下 307 重定向死循环 | 代码将 307 重写回 Nginx，Nginx 又转发到 FE，FE 又 307 | `rewriteRedirectUrl` 自动检测代理模式，重写回 Nginx 代理地址 |
 | 11 | Doris JDBC 连接超时（Nginx 代理端口） | `dorisDataSource` 用 `replace(":8030", ":9030")` 推导 JDBC URL，代理端口非 8030 时失败 | 改为提取主机名 + 固定端口 9030 |
 | 12 | MySQL `Public Key Retrieval is not allowed` | JDBC URL 缺少 `allowPublicKeyRetrieval=true` | 添加该参数 |
+
+---
+
+## 七、安全与架构优化（2026-06-22）
+
+### 高严重度问题修复
+
+#### 1. 配置文件硬编码数据库密码
+
+**文件：** `application.yml`、`application-test.yml`
+
+**问题：** MySQL 和 Doris 的密码以明文形式写死在版本控制文件中，存在安全风险。
+
+**修复：** 改为从环境变量读取：
+
+| 配置项 | 修改前 | 修改后 |
+|--------|--------|--------|
+| MySQL 密码 | 明文密码 | `${MYSQL_PASSWORD}` |
+| Doris 密码 | 明文密码 | `${DORIS_PASSWORD}` |
+
+**使用方式：**
+```bash
+MYSQL_PASSWORD='your_password' DORIS_PASSWORD='your_password' mvn spring-boot:run -Dspring-boot.run.profiles=test
+```
+
+#### 2. 线程池在消费者出错后不关闭
+
+**文件：** `DataPipeline.java`
+
+**问题：** 调用 `executor.shutdown()` 后，如果生产者先报错退出，消费者线程会一直挂起（`shutdown()` 不会终止运行中的任务），且没有 `shutdownNow()` 兜底，导致 JVM 无法干净退出。
+
+**修复：** 添加超时等待和强制关闭：
+```java
+finally {
+    if (!executor.isTerminated()) {
+        if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+            executor.shutdownNow();
+        }
+    }
+}
+```
+
+#### 3. SQL 注入风险
+
+**文件：** `VerifyService.java`
+
+**问题：** 主键值通过字符串拼接直接拼入 SQL 的 IN 子句，如果主键包含引号字符会导致注入。表名拼接也存在类似问题。
+
+**修复：** 使用 `PreparedStatement` 参数化查询，表名通过正则校验：
+```java
+// 参数化查询
+try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+    pstmt.setString(1, value);
+    ...
+}
+
+// 表名校验
+if (!identifier.matches("[a-zA-Z0-9_\\-]+")) {
+    throw new IllegalArgumentException("非法标识符");
+}
+```
+
+#### 4. 生产者可能死锁
+
+**文件：** `DataPipeline.java`
+
+**问题：** 生产者每 10000 行检查一次消费者错误。如果消费者失败且队列满（容量 8），`queue.put()` 会永久阻塞，而生产者要等到下一个检查间隔才知道消费者已死。
+
+**修复：** 使用 `queue.offer(timeout)` 替代阻塞 `put()`：
+```java
+if (!queue.offer(batch, 30, TimeUnit.SECONDS)) {
+    throw new StreamLoadException("队列已满，生产超时");
+}
+```
+
+#### 5. System.exit() 绕过 Spring 生命周期
+
+**文件：** `StreamLoadRunner.java`、`StreamLoadApplication.java`
+
+**问题：** 多处调用 `System.exit()`，导致 Spring 上下文无法正常关闭，`@PreDestroy` 回调不会被执行，连接池不会优雅释放。
+
+**修复：** 实现 `ExitCodeGenerator` 接口，让 Spring Boot 自动处理退出流程：
+```java
+public class StreamLoadRunner implements CommandLineRunner, ExitCodeGenerator {
+    private int exitCode = 0;
+    
+    @Override
+    public int getExitCode() {
+        return exitCode;
+    }
+}
+```
+
+### 中等严重度问题修复
+
+#### 6. Checkpoint CAS 竞态
+
+**文件：** `CheckpointManager.java`
+
+**问题：** `compareAndSet` 的期望值在 `completedBatches.size()` 之后计算，多线程环境下可能算错，导致保存间隔被跳过或翻倍。
+
+**修复：** 使用原子变量和正确的 CAS 逻辑：
+```java
+int currentCount = completedBatches.size();
+int expected = currentCount - (currentCount % SAVE_INTERVAL);
+if (lastSaveCount.compareAndSet(expected, currentCount)) {
+    saveCheckpoint();
+}
+```
+
+#### 7. 重试逻辑不分青红皂白
+
+**文件：** `StreamLoadService.java`
+
+**问题：** 所有异常都同等对待并重试。HTTP 4xx 错误（如请求格式错误）不应该重试，标签冲突也不应该重试。
+
+**修复：** 区分可重试和不可重试错误：
+- 5xx 错误：可重试
+- 4xx 错误：不可重试
+- 标签冲突：不可重试
+
+#### 8. VerifyMode 枚举重复定义
+
+**文件：** `VerifyParam.java`、`VerifyProperties.java`
+
+**问题：** 两个文件各自定义了相同的 `VerifyMode` 枚举，容易混淆。
+
+**修复：** 删除 `VerifyProperties.java` 中的重复定义，统一使用 `VerifyParam.VerifyMode`。
+
+#### 9. 采样验证假设第一列为主键
+
+**文件：** `VerifyService.java`
+
+**问题：** `columns[0]` 被当作主键使用，但配置中 `verify-columns` 可能是任意列，如果有重复值会导致匹配计数错误。
+
+**修复：** 使用全部指定列作为匹配键，不再假设第一列是主键。
+
+#### 10. DorisProperties 职责过多
+
+**文件：** `DorisProperties.java`
+
+**问题：** 一个类包含了约 30 个配置字段，混合了 HTTP 超时、压缩、Docker 网络、检查点、日志间隔等，职责不清。
+
+**修复：** 拆分为多个子配置类：
+- `DorisConnectionProperties`：连接配置
+- `DorisHttpProperties`：HTTP 配置  
+- `DorisDockerProperties`：Docker 网络配置
+- `DorisStreamLoadProperties`：Stream Load 配置
+
+### 低严重度问题修复
+
+#### 11. 标签生成可能碰撞
+
+**文件：** `StreamLoadService.java`
+
+**问题：** 使用 `System.currentTimeMillis()` 生成唯一标签，多线程并发时同一毫秒内可能生成相同标签，导致 Stream Load 冲突。
+
+**修复：** 使用 UUID 替代 timestamp：
+```java
+private String generateLabel(int batchIndex) {
+    return String.format("stream_load_%s_%s_%d",
+            properties.getDatabase(), 
+            UUID.randomUUID().toString().substring(0, 16), 
+            batchIndex);
+}
+```
+
+#### 12. Keep-Alive 无效
+
+**文件：** `StreamLoadService.java`
+
+**问题：** `HttpURLConnection` 的 Keep-Alive 是 TCP 层面的，每次 `openConnection()` 并不保证复用连接。
+
+**修复：** 使用 Apache HttpClient 5 连接池：
+```java
+PoolingHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager();
+connManager.setMaxTotal(20);
+connManager.setDefaultMaxPerRoute(10);
+```
+
+### 测试验证
+
+所有修复已通过测试验证：
+- ✅ 导入成功：8991 条记录
+- ✅ 验证通过：记录数一致
+- ✅ Spring 上下文优雅关闭
+- ✅ 连接池正常释放

@@ -11,24 +11,36 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.hc.client5.http.classic.methods.HttpPut;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.HttpHost;
+import org.apache.hc.core5.http.HttpResponse;
+import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
 
 /**
  * Stream Load 核心服务
  * 负责将数据批量导入到 Doris，支持 gzip 压缩、自动重试、幂等提交
- * 使用 Java 原生 HttpURLConnection，避免第三方 HTTP 客户端的代理问题
+ * 使用 Apache HttpClient 连接池，支持真正的 Keep-Alive 和连接复用
  */
 @Slf4j
 @Service
@@ -37,50 +49,63 @@ public class StreamLoadService {
     private final DorisProperties properties;
     private final CheckpointManager checkpointManager;
     private final ObjectMapper objectMapper;
-    // 优化: 预创建 ObjectWriter，避免每次序列化都重新配置
     private final com.fasterxml.jackson.databind.ObjectWriter objectWriter;
-    
-    // 优化: 缓存 Base64 编码的认证信息，避免每次请求都重新计算
     private final String encodedAuth;
+    private final CloseableHttpClient httpClient;
 
     public StreamLoadService(DorisProperties properties, CheckpointManager checkpointManager) {
         this.properties = properties;
         this.checkpointManager = checkpointManager;
         this.objectMapper = new ObjectMapper();
-        // 优化: 预创建 ObjectWriter，复用配置
         this.objectWriter = objectMapper.writer();
-        
-        // 启用受限 HTTP头的支持，允许手动设置 Expect: 100-continue
-        System.setProperty("sun.net.http.allowRestrictedHeaders", "true");
-        
-        // 预计算 Base64 认证信息
+
         String auth = properties.getUsername() + ":" + properties.getPassword();
         this.encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes(StandardCharsets.UTF_8));
+
+        this.httpClient = createHttpClient();
+        log.info("Apache HttpClient 连接池初始化完成");
     }
 
-    /**
-     * 执行 Stream Load
-     *
-     * @param batchIndex 批次索引
-     * @param tableName  目标表名
-     * @param data       数据列表 (每行是一个 Map)
-     * @return 导入结果
-     */
+    private CloseableHttpClient createHttpClient() {
+        PoolingHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager();
+        connManager.setMaxTotal(20);
+        connManager.setDefaultMaxPerRoute(10);
+
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(Timeout.ofSeconds(properties.getConnectTimeout()))
+                .setResponseTimeout(Timeout.ofSeconds(properties.getTimeout()))
+                .setRedirectsEnabled(false)
+                .build();
+
+        return HttpClients.custom()
+                .setConnectionManager(connManager)
+                .setDefaultRequestConfig(requestConfig)
+                .disableAutomaticRetries()
+                .build();
+    }
+
+    @PreDestroy
+    public void destroy() {
+        if (httpClient != null) {
+            try {
+                httpClient.close();
+                log.info("Apache HttpClient 连接池已关闭");
+            } catch (IOException e) {
+                log.warn("关闭 HttpClient 连接池时出现异常", e);
+            }
+        }
+    }
+
     public LoadResult executeLoad(int batchIndex, String tableName, List<Map<String, Object>> data)
             throws StreamLoadHttpException, StreamLoadIOException, StreamLoadCompressionException {
-        // 检查是否已完成 (断点续传)
         if (checkpointManager.isBatchCompleted(batchIndex)) {
             log.info("批次 {} 已完成,跳过", batchIndex);
             return new LoadResult(true, "SKIPPED", data.size());
         }
 
-        // 生成唯一 label (幂等性)
         String label = generateLabel(batchIndex);
-
-        // 转换为 JSON
         String jsonData = convertToJson(data);
 
-        // 压缩数据 (如果启用)
         byte[] payload;
         boolean compressed;
         if (properties.isEnableCompression()) {
@@ -94,10 +119,8 @@ public class StreamLoadService {
             compressed = false;
         }
 
-        // 构建 HTTP 请求 URL
         String url = buildLoadUrl(tableName);
 
-        // 重试逻辑
         int retryCount = 0;
         Exception lastException = null;
 
@@ -108,13 +131,32 @@ public class StreamLoadService {
                     checkpointManager.markBatchCompleted(batchIndex);
                 }
                 return result;
-            } catch (StreamLoadHttpException | StreamLoadIOException e) {
+            } catch (StreamLoadHttpException e) {
                 lastException = e;
+                if (!isRetriable(e)) {
+                    throw e;
+                }
                 retryCount++;
 
                 if (retryCount <= properties.getMaxRetry()) {
                     long waitTime = (long) Math.pow(properties.getRetryIntervalBase(), retryCount);
                     log.warn("批次 {} 失败,第 {} 次重试,等待 {} 秒: {}",
+                            batchIndex, retryCount, waitTime, e.getMessage());
+
+                    try {
+                        Thread.sleep(waitTime * 1000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new StreamLoadIOException("重试被中断", ie);
+                    }
+                }
+            } catch (StreamLoadIOException e) {
+                lastException = e;
+                retryCount++;
+
+                if (retryCount <= properties.getMaxRetry()) {
+                    long waitTime = (long) Math.pow(properties.getRetryIntervalBase(), retryCount);
+                    log.warn("批次 {} IO异常,第 {} 次重试,等待 {} 秒: {}",
                             batchIndex, retryCount, waitTime, e.getMessage());
 
                     try {
@@ -132,107 +174,96 @@ public class StreamLoadService {
                 lastException);
     }
 
-    /**
-     * 执行实际的 HTTP 请求 (使用 Java 原生 HttpURLConnection)
-     */
+    private boolean isRetriable(StreamLoadHttpException e) {
+        int statusCode = e.getStatusCode();
+        if (statusCode >= 500 && statusCode < 600) {
+            return true;
+        }
+        if (statusCode >= 400 && statusCode < 500) {
+            log.warn("批次 {} 收到 4xx 错误 (HTTP {}), 不进行重试: {}",
+                    e.getMessage(), statusCode, e.getMessage());
+            return false;
+        }
+        String msg = e.getMessage();
+        if (msg != null && msg.contains("Label Already Exists")) {
+            return false;
+        }
+        return true;
+    }
+
     private LoadResult doLoad(String urlStr, String label, byte[] payload, boolean compressed, int recordCount)
             throws StreamLoadHttpException, StreamLoadIOException {
 
         String currentUrl = urlStr;
         int maxRedirects = properties.getMaxRedirects();
         int redirectCount = 0;
-        
+
         while (redirectCount < maxRedirects) {
-            HttpURLConnection conn = null;
             try {
                 URL url = new URL(currentUrl);
-                // 使用默认代理配置，允许通过 Nginx 代理访问
-                conn = (HttpURLConnection) url.openConnection();
+                HttpHost target = new HttpHost(url.getProtocol(), url.getHost(), url.getPort());
+                String path = url.getPath() + (url.getQuery() != null ? "?" + url.getQuery() : "");
 
-                // 优化: 启用 HTTP Keep-Alive，复用连接提升吞吐量
-                conn.setRequestMethod("PUT");
-                conn.setDoOutput(true);
-                conn.setDoInput(true);
-                conn.setInstanceFollowRedirects(false);  // 禁用自动重定向，手动处理
-                conn.setUseCaches(false);
+                HttpPut httpPut = new HttpPut(path);
 
-                // 设置超时
-                conn.setConnectTimeout(properties.getConnectTimeout() * 1000);
-                conn.setReadTimeout(properties.getTimeout() * 1000);
-
-                // 设置请求头
-                conn.setRequestProperty("label", label);
-                conn.setRequestProperty("format", "json");
-                conn.setRequestProperty("strip_outer_array", "true");
-                conn.setRequestProperty("timeout", String.valueOf(properties.getTimeout()));
-                conn.setRequestProperty("max_filter_ratio", String.valueOf(properties.getMaxFilterRatio()));
-                conn.setRequestProperty("Expect", "100-continue");  // Doris 要求必须有此头
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setRequestProperty("Content-Length", String.valueOf(payload.length));
+                httpPut.setHeader("label", label);
+                httpPut.setHeader("format", "json");
+                httpPut.setHeader("strip_outer_array", "true");
+                httpPut.setHeader("timeout", String.valueOf(properties.getTimeout()));
+                httpPut.setHeader("max_filter_ratio", String.valueOf(properties.getMaxFilterRatio()));
+                httpPut.setHeader("Expect", "100-continue");
+                httpPut.setHeader("Content-Type", "application/json");
 
                 if (compressed) {
-                    conn.setRequestProperty("Content-Encoding", "gzip");
+                    httpPut.setHeader("Content-Encoding", "gzip");
                 }
 
-                // 优化: 使用预计算的 Base64 认证信息
-                conn.setRequestProperty("Authorization", "Basic " + encodedAuth);
+                httpPut.setHeader("Authorization", "Basic " + encodedAuth);
 
-                // 发送请求数据
-                try (OutputStream os = conn.getOutputStream()) {
-                    os.write(payload);
-                    os.flush();
-                }
+                HttpEntity entity = new ByteArrayEntity(payload,
+                        compressed ? ContentType.APPLICATION_JSON.withCharset(StandardCharsets.UTF_8)
+                                : ContentType.APPLICATION_JSON.withCharset(StandardCharsets.UTF_8));
+                httpPut.setEntity(entity);
 
-                // 读取响应
-                int statusCode = conn.getResponseCode();
-                
-                // 处理 307 重定向
-                if (statusCode == 307) {
-                    String location = conn.getHeaderField("Location");
-                    if (location != null && !location.isEmpty()) {
-                        log.debug("收到 307 重定向到: {}", location);
-                        // 处理 Docker 内部 IP，替换为 Nginx 代理地址
-                        currentUrl = rewriteRedirectUrl(location);
-                        log.debug("重写后的重定向 URL: {}", currentUrl);
-                        redirectCount++;
-                        conn.disconnect();
-                        continue;  // 继续循环，发送到新的 URL
-                    } else {
-                        throw new StreamLoadHttpException(statusCode, "", "307 重定向但没有 Location 头");
+                log.debug("发送请求到: {}://{}:{}{}", url.getProtocol(), url.getHost(), url.getPort(), path);
+
+                try (CloseableHttpResponse response = httpClient.execute(target, httpPut)) {
+                    int statusCode = response.getCode();
+                    String responseBody;
+                    try {
+                        responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                    } catch (org.apache.hc.core5.http.ParseException e) {
+                        throw new StreamLoadIOException("解析响应体失败: " + e.getMessage(), e);
                     }
-                }
-                
-                String responseBody;
-                try (InputStream is = (statusCode >= 200 && statusCode < 300) ? conn.getInputStream() : conn.getErrorStream()) {
-                    if (is != null) {
-                        responseBody = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-                    } else {
-                        responseBody = "";
+
+                    log.debug("Doris 响应: statusCode={}, body={}", statusCode, responseBody);
+
+                    if (statusCode == 307) {
+                        String location = response.getFirstHeader("Location") != null
+                                ? response.getFirstHeader("Location").getValue() : null;
+                        if (location != null && !location.isEmpty()) {
+                            log.debug("收到 307 重定向到: {}", location);
+                            currentUrl = rewriteRedirectUrl(location);
+                            log.debug("重写后的重定向 URL: {}", currentUrl);
+                            redirectCount++;
+                            continue;
+                        } else {
+                            throw new StreamLoadHttpException(statusCode, responseBody, "307 重定向但没有 Location 头");
+                        }
                     }
+
+                    LoadResponse loadResponse = parseResponse(responseBody);
+                    return handleResponse(statusCode, responseBody, loadResponse, label, recordCount);
                 }
-
-                // 解析响应
-                log.debug("Doris 响应: statusCode={}, body={}", statusCode, responseBody);
-                LoadResponse loadResponse = parseResponse(responseBody);
-
-                // 处理响应结果
-                return handleResponse(statusCode, responseBody, loadResponse, label, recordCount);
 
             } catch (IOException e) {
                 throw new StreamLoadIOException("HTTP 请求异常: " + e.getMessage(), e);
-            } finally {
-                if (conn != null) {
-                    conn.disconnect();
-                }
             }
         }
-        
+
         throw new StreamLoadHttpException(0, "", "重定向次数超过限制: " + maxRedirects);
     }
 
-    /**
-     * 处理原始响应，转换为 LoadResult
-     */
     private LoadResult handleResponse(int statusCode, String responseBody, LoadResponse loadResponse, String label, int recordCount)
             throws StreamLoadHttpException {
 
@@ -255,19 +286,15 @@ public class StreamLoadService {
                         String.format("Label 已存在但状态异常: %s", loadResponse.getExistingJobStatus()));
             }
         } else {
-            log.error("导入失败详情: Status={}, Message={}, FilteredRows={}, ErrorURL={}", 
+            log.error("导入失败详情: Status={}, Message={}, FilteredRows={}, ErrorURL={}",
                     status, loadResponse.getMessage(), loadResponse.getNumberFilteredRows(), loadResponse.getErrorURL());
             throw new StreamLoadHttpException(statusCode, responseBody,
                     String.format("导入失败: Status=%s, Message=%s", status, loadResponse.getMessage()));
         }
     }
 
-    /**
-     * 将数据转换为 JSON 格式
-     */
     private String convertToJson(List<Map<String, Object>> data) {
         try {
-            // 优化: 使用预创建的 ObjectWriter
             return objectWriter.writeValueAsString(data);
         } catch (IOException e) {
             log.error("JSON 序列化失败", e);
@@ -275,9 +302,6 @@ public class StreamLoadService {
         }
     }
 
-    /**
-     * gzip 压缩
-     */
     private byte[] compress(String data) throws StreamLoadCompressionException {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
              GZIPOutputStream gzipOut = new GZIPOutputStream(baos)) {
@@ -289,41 +313,17 @@ public class StreamLoadService {
         }
     }
 
-    /**
-     * 生成唯一 Label
-     */
     private String generateLabel(int batchIndex) {
-        return String.format("stream_load_%s_%d_%d",
-                properties.getDatabase(), System.currentTimeMillis(), batchIndex);
+        return String.format("stream_load_%s_%s_%d",
+                properties.getDatabase(), UUID.randomUUID().toString().replace("-", "").substring(0, 16), batchIndex);
     }
 
-    /**
-     * 重写重定向 URL，处理 Docker 内部 IP 和容器名
-     * <p>
-     * Doris Stream Load 流程：
-     * 1. 客户端向 FE 发送导入请求（通过 Nginx 代理或直连）
-     * 2. FE 返回 307 重定向，指向 BE 的地址（如 doris-be:8040 或 172.x.x.x:8040）
-     * 3. 客户端需要跟随重定向，将数据直接发送到 BE
-     * <p>
-     * 注意：无论是否使用 Nginx 代理，重定向后都应直接访问 BE 的 Docker 映射端口 8040，
-     * 避免将重定向 URL 重写回 Nginx 代理造成重定向循环。
-     * <p>
-     * 可配置项（application.yml）：
-     * - doris.be-host: 重写目标主机地址，默认 127.0.0.1
-     * - doris.be-http-port: 重写目标端口，默认 8040
-     * - doris.docker-internal-ip-prefixes: 内部 IP 前缀列表，默认 "172.,10.,192.168."
-     * - doris.docker-container-names: 容器名列表，默认 "doris-be,doris-fe,doris"
-     * 
-     * @param location 重定向 URL
-     * @return 处理后的 URL
-     */
     private String rewriteRedirectUrl(String location) {
         try {
             URL redirectUrl = new URL(location);
-            
+
             String host = redirectUrl.getHost();
-            
-            // 从配置读取内部 IP 前缀列表
+
             String[] internalIpPrefixes = properties.getDockerInternalIpPrefixes().split(",");
             boolean isInternalIp = false;
             for (String prefix : internalIpPrefixes) {
@@ -332,8 +332,7 @@ public class StreamLoadService {
                     break;
                 }
             }
-            
-            // 从配置读取 Docker 容器名列表
+
             String[] containerNames = properties.getDockerContainerNames().split(",");
             boolean isDockerContainer = false;
             for (String name : containerNames) {
@@ -342,37 +341,41 @@ public class StreamLoadService {
                     break;
                 }
             }
-            
+
             if (isInternalIp || isDockerContainer) {
-                // 直接重写为配置的 BE 地址:端口，访问 BE 的 Docker 映射端口
-                // 无论是否使用 Nginx 代理，重定向后都应直连 BE，避免重定向循环
-                String rewritten = String.format("%s://%s:%d%s?%s",
+                String rewritten = String.format("%s://%s:%d%s%s",
                         redirectUrl.getProtocol(),
                         properties.getBeHost(),
                         properties.getBeHttpPort(),
                         redirectUrl.getPath(),
-                        redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");
+                        redirectUrl.getQuery() != null ? "?" + redirectUrl.getQuery() : "");
                 log.debug("Docker 内部地址重定向，重写为直接访问 BE: {}", rewritten);
                 return rewritten;
             }
-            return location;
+            return removeUserInfo(location);
         } catch (Exception e) {
             log.warn("重写重定向 URL 失败，使用原始 URL: {}", location, e);
             return location;
         }
     }
 
-    /**
-     * 构建 Load URL
-     */
     private String buildLoadUrl(String tableName) {
         return String.format("%s/api/%s/%s/_stream_load",
                 properties.getLoadUrl(), properties.getDatabase(), tableName);
     }
 
-    /**
-     * 解析响应
-     */
+    private String removeUserInfo(String url) {
+        try {
+            URL u = new URL(url);
+            if (u.getUserInfo() != null) {
+                return new URL(u.getProtocol(), u.getHost(), u.getPort(), u.getFile()).toString();
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+        return url;
+    }
+
     private LoadResponse parseResponse(String responseBody) {
         try {
             return objectMapper.readValue(responseBody, LoadResponse.class);
@@ -385,9 +388,6 @@ public class StreamLoadService {
         }
     }
 
-    /**
-     * 加载结果
-     */
     @Data
     @AllArgsConstructor
     public static class LoadResult {
@@ -396,9 +396,6 @@ public class StreamLoadService {
         private int recordCount;
     }
 
-    /**
-     * 加载响应
-     */
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class LoadResponse {
@@ -410,7 +407,7 @@ public class StreamLoadService {
         @JsonProperty("Message")
         private String message;
         @JsonProperty("msg")
-        private String msg;  // Doris 错误响应使用 msg 字段
+        private String msg;
         @JsonProperty("ExistingJobStatus")
         private String existingJobStatus;
         @JsonProperty("TxnId")
@@ -423,10 +420,7 @@ public class StreamLoadService {
         private long numberFilteredRows;
         @JsonProperty("ErrorURL")
         private String errorURL;
-        
-        /**
-         * 获取消息（兼容 message 和 msg）
-         */
+
         public String getMessage() {
             return message != null ? message : msg;
         }

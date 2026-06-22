@@ -1,5 +1,6 @@
 package com.example.streamload.config;
 
+import com.example.streamload.verify.VerifyParam;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
@@ -15,7 +16,7 @@ public class VerifyProperties {
     /**
      * 验证模式: NONE, COUNT, SAMPLE
      */
-    private VerifyMode mode = VerifyMode.COUNT;
+    private VerifyParam.VerifyMode mode = VerifyParam.VerifyMode.COUNT;
     
     /**
      * 抽样验证比例 (0-1)
@@ -41,22 +42,4 @@ public class VerifyProperties {
      * 抽样验证最大样本数
      */
     private int maxSampleSize = 1000;
-    
-    /**
-     * 验证模式枚举
-     */
-    public enum VerifyMode {
-        /**
-         * 不验证
-         */
-        NONE,
-        /**
-         * 仅验证记录数
-         */
-        COUNT,
-        /**
-         * 抽样验证 (对比部分记录)
-         */
-        SAMPLE
-    }
 }

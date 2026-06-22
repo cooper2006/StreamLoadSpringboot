@@ -5,8 +5,8 @@ spring:
   datasource:
     # 源数据库配置 (MySQL/PostgreSQL)
     url: jdbc:mysql://localhost:3306/source_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
-    username: root
-    password: ServBay.dev
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 5
@@ -16,12 +16,12 @@ spring:
 # Doris Stream Load 配置
 doris:
   # Stream Load HTTP 地址
-  load-url: http://localhost:8030
+  load-url: ${DORIS_LOAD_URL:http://localhost:8030}
   # 目标数据库
-  database: target_db
+  database: ${DORIS_DATABASE:target_db}
   # 认证信息
-  username: root
-  password: Root@123456
+  username: ${DORIS_USERNAME:root}
+  password: ${DORIS_PASSWORD}
   # 批次大小 (每批记录数)
   batch-size: 100000
   # 是否启用 gzip 压缩

@@ -13,6 +13,7 @@
 - **数据验证**：导入完成后自动验证源表和目标表数据一致性
 - **Nginx 代理支持**：自动检测代理模式，正确处理 307 重定向
 - **失败批次控制**：超过 3 批失败自动停止，避免无效重试
+- **安全配置**：密码通过环境变量注入，避免硬编码到配置文件
 
 ## 技术栈
 
@@ -66,24 +67,37 @@ source scripts/init_doris_table.sql
 
 ### 5. 配置数据库连接
 
+配置文件支持环境变量注入，避免密码硬编码。
+
+**环境变量列表：**
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `MYSQL_URL` | MySQL JDBC URL | `jdbc:mysql://127.0.0.1:3306/test_db?...` |
+| `MYSQL_USERNAME` | MySQL 用户名 | `root` |
+| `MYSQL_PASSWORD` | MySQL 密码 | 无（必须设置） |
+| `DORIS_LOAD_URL` | Doris Stream Load 地址 | `http://127.0.0.1:8030` |
+| `DORIS_DATABASE` | Doris 数据库名 | `test_db` |
+| `DORIS_USERNAME` | Doris 用户名 | `root` |
+| `DORIS_PASSWORD` | Doris 密码 | 无（必须设置） |
+
 编辑 `src/main/resources/application-test.yml`：
 
 ```yaml
 spring:
   datasource:
-    # MySQL 连接配置
-    url: jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
-    username: root
-    password: your_mysql_password  # 修改为你的 MySQL 密码
+    url: ${MYSQL_URL:jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true}
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD}
 
 doris:
   # Doris Stream Load HTTP 地址
   # 直连模式：http://127.0.0.1:8030
   # Nginx 代理模式：http://127.0.0.1:18030（自动检测代理模式）
-  load-url: http://127.0.0.1:8030
-  database: test_db
-  username: root
-  password: your_doris_password  # 修改为你的 Doris 密码
+  load-url: ${DORIS_LOAD_URL:http://127.0.0.1:8030}
+  database: ${DORIS_DATABASE:test_db}
+  username: ${DORIS_USERNAME:root}
+  password: ${DORIS_PASSWORD}
   
   # 批次大小（每批记录数）
   batch-size: 50000
@@ -116,11 +130,13 @@ location / {
 ### 6. 运行导入
 
 ```bash
-# 使用 test profile 运行
+# 使用环境变量传递密码，运行 test profile
+MYSQL_PASSWORD='your_mysql_password' DORIS_PASSWORD='your_doris_password' \
 mvn spring-boot:run -Dspring-boot.run.profiles=test
 
 # 或打包后运行
 mvn clean package
+MYSQL_PASSWORD='your_mysql_password' DORIS_PASSWORD='your_doris_password' \
 java -jar target/stream-load-doris-1.0.0.jar --spring.profiles.active=test
 ```
 
