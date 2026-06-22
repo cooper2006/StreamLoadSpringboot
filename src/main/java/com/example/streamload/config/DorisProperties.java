@@ -88,6 +88,36 @@ public class DorisProperties {
     private int beHttpPort = 8040;
     
     /**
+     * Doris BE 主机地址 (重定向重写目标)
+     */
+    private String beHost = "127.0.0.1";
+    
+    /**
+     * Docker 内部 IP 前缀列表（逗号分隔），用于识别需要重写的重定向地址
+     */
+    private String dockerInternalIpPrefixes = "172.,10.,192.168.";
+    
+    /**
+     * Docker 容器名列表（逗号分隔），用于识别需要重写的重定向地址
+     */
+    private String dockerContainerNames = "doris-be,doris-fe,doris";
+    
+    /**
+     * 日期格式化字符串 (用于 Doris 兼容的时间格式)
+     */
+    private String dateFormat = "yyyy-MM-dd HH:mm:ss";
+    
+    /**
+     * 进度日志输出间隔 (批次)
+     */
+    private int progressLogInterval = 10;
+    
+    /**
+     * 进度报告间隔 (秒)
+     */
+    private int progressReportInterval = 5;
+    
+    /**
      * 消费者线程数 (并行导入)
      */
     private int consumerThreads = 3;

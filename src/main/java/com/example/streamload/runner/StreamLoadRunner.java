@@ -80,7 +80,8 @@ public class StreamLoadRunner implements CommandLineRunner {
                     tableName
             );
 
-            // 启动进度监控线程
+            // 启动进度监控线程 (进度报告间隔从配置读取，默认5秒)
+            int progressReportInterval = dorisProperties.getProgressReportInterval();
             Thread progressThread = new Thread(() -> {
                 try {
                     while (!pipeline.isCompleted() || !pipeline.isConsumerCompleted()) {
@@ -90,7 +91,7 @@ public class StreamLoadRunner implements CommandLineRunner {
                                 pipeline.getConsumedBatchCount(),
                                 pipeline.getImportedRecordCount(),
                                 pipeline.getFailedBatchCount());
-                        Thread.sleep(5000);
+                        Thread.sleep(progressReportInterval * 1000L);
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();

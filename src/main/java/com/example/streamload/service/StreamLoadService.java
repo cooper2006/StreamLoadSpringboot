@@ -307,6 +307,12 @@ public class StreamLoadService {
      * <p>
      * 注意：无论是否使用 Nginx 代理，重定向后都应直接访问 BE 的 Docker 映射端口 8040，
      * 避免将重定向 URL 重写回 Nginx 代理造成重定向循环。
+     * <p>
+     * 可配置项（application.yml）：
+     * - doris.be-host: 重写目标主机地址，默认 127.0.0.1
+     * - doris.be-http-port: 重写目标端口，默认 8040
+     * - doris.docker-internal-ip-prefixes: 内部 IP 前缀列表，默认 "172.,10.,192.168."
+     * - doris.docker-container-names: 容器名列表，默认 "doris-be,doris-fe,doris"
      * 
      * @param location 重定向 URL
      * @return 处理后的 URL
@@ -316,16 +322,33 @@ public class StreamLoadService {
             URL redirectUrl = new URL(location);
             
             String host = redirectUrl.getHost();
-            boolean isInternalIp = host.startsWith("172.") || host.startsWith("10.") || host.startsWith("192.168.");
-            boolean isDockerContainer = host.equalsIgnoreCase("doris-be") || 
-                                        host.equalsIgnoreCase("doris-fe") ||
-                                        host.contains("doris");
+            
+            // 从配置读取内部 IP 前缀列表
+            String[] internalIpPrefixes = properties.getDockerInternalIpPrefixes().split(",");
+            boolean isInternalIp = false;
+            for (String prefix : internalIpPrefixes) {
+                if (host.startsWith(prefix.trim())) {
+                    isInternalIp = true;
+                    break;
+                }
+            }
+            
+            // 从配置读取 Docker 容器名列表
+            String[] containerNames = properties.getDockerContainerNames().split(",");
+            boolean isDockerContainer = false;
+            for (String name : containerNames) {
+                if (host.equalsIgnoreCase(name.trim()) || host.contains(name.trim())) {
+                    isDockerContainer = true;
+                    break;
+                }
+            }
             
             if (isInternalIp || isDockerContainer) {
-                // 直接重写为 127.0.0.1:8040 访问 BE 的 Docker 映射端口
+                // 直接重写为配置的 BE 地址:端口，访问 BE 的 Docker 映射端口
                 // 无论是否使用 Nginx 代理，重定向后都应直连 BE，避免重定向循环
-                String rewritten = String.format("%s://127.0.0.1:%d%s?%s",
+                String rewritten = String.format("%s://%s:%d%s?%s",
                         redirectUrl.getProtocol(),
+                        properties.getBeHost(),
                         properties.getBeHttpPort(),
                         redirectUrl.getPath(),
                         redirectUrl.getQuery() != null ? redirectUrl.getQuery() : "");

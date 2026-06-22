@@ -52,8 +52,7 @@ public class DataPipeline implements ProducerState, ConsumerState {
     private static final BatchData POISON_PILL = new BatchData(-1, Collections.emptyList());
 
     // 日期格式化器 (线程安全,用于 Doris 兼容的时间格式)
-    private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT =
-            ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+    private final ThreadLocal<SimpleDateFormat> DATE_FORMAT;
 
     public DataPipeline(JdbcTemplate jdbcTemplate,
                         StreamLoadService streamLoadService,
@@ -66,6 +65,9 @@ public class DataPipeline implements ProducerState, ConsumerState {
         this.sourceSql = sourceSql;
         this.tableName = tableName;
         this.queue = new LinkedBlockingQueue<>(properties.getQueueCapacity());
+        // 从配置读取日期格式，支持自定义
+        String dateFormatPattern = properties.getDateFormat();
+        this.DATE_FORMAT = ThreadLocal.withInitial(() -> new SimpleDateFormat(dateFormatPattern));
     }
 
     /**
@@ -195,7 +197,7 @@ public class DataPipeline implements ProducerState, ConsumerState {
 
                 if (batch.size() >= properties.getBatchSize()) {
                     // 优化: 减少日志输出，只在关键节点记录
-                    if (batchIndex % 10 == 0) {
+                    if (batchIndex % properties.getProgressLogInterval() == 0) {
                         log.info("生产者: 批次 {} 已入队, 累计 {} 条", batchIndex, producedRecordCount.get());
                     }
                     BatchData batchData = new BatchData(batchIndex, new ArrayList<>(batch));
@@ -286,8 +288,8 @@ public class DataPipeline implements ProducerState, ConsumerState {
                     if (result.isSuccess()) {
                         consumedBatchCount.incrementAndGet();
                         importedRecordCount.addAndGet(result.getRecordCount());
-                        // 优化: 减少日志输出，每10批记录一次
-                        if (consumedBatchCount.get() % 10 == 0) {
+                        // 优化: 减少日志输出，按配置间隔记录
+                        if (consumedBatchCount.get() % properties.getProgressLogInterval() == 0) {
                             log.info("消费者: 批次 {} 导入成功, 累计 {} 条",
                                     batchData.getBatchIndex(), importedRecordCount.get());
                         }
