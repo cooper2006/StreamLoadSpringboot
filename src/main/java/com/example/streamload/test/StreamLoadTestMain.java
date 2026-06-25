@@ -49,13 +49,13 @@ public class StreamLoadTestMain {
 
     static final String MYSQL_URL      = env("MYSQL_URL",      "jdbc:mysql://127.0.0.1:3306/test_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true");
     static final String MYSQL_USER     = env("MYSQL_USERNAME", "root");
-    static final String MYSQL_PASS     = env("MYSQL_PASSWORD", "");
+    static final String MYSQL_PASS     = env("MYSQL_PASSWORD", "ServBay.dev");
     static final String MYSQL_DRIVER   = "com.mysql.cj.jdbc.Driver";
 
-    static final String DORIS_LOAD_URL = env("DORIS_LOAD_URL", "http://127.0.0.1:8030");
+    static final String DORIS_LOAD_URL = env("DORIS_LOAD_URL", "http://127.0.0.1:18030");
     static final String DORIS_DB       = env("DORIS_DATABASE", "test_db");
     static final String DORIS_USER     = env("DORIS_USERNAME", "root");
-    static final String DORIS_PASS     = env("DORIS_PASSWORD", "");
+    static final String DORIS_PASS     = env("DORIS_PASSWORD", "Root@123456");
     static final int    DORIS_JDBC_PORT = Integer.parseInt(env("DORIS_JDBC_PORT", "9030"));
     static final int    DORIS_BE_HTTP   = Integer.parseInt(env("DORIS_BE_HTTP_PORT", "8040"));
 
