@@ -1,0 +1,309 @@
+@startuml title MVN Spring-Boot:Run - Test Profile Sequence Diagram
+
+!theme default skinparam backgroundColor #FEFEFE
+!theme default skinparam responseMessageBelowArrow true
+!theme default skinparam ArrowColor #333
+!theme default skinparam ArrowThickness 2
+
+autonumber
+
+actor User as user
+participant "Maven CLI\n(mvn)" as maven
+participant "Spring Boot\nMaven Plugin" as plugin
+participant "Spring Boot\nLoader" as loader
+participant "Spring Application\nContext" as context
+participant "StreamLoadApplication" as app
+participant "DataSourceConfig" as dsconfig
+participant "HikariCP" as hikari
+participant "DorisProperties\n(test profile)" as dprops
+participant "VerifyProperties\n(test profile)" as vprops
+participant "CheckpointManager" as ckpt
+participant "StreamLoadService" as sload
+participant "HttpClient\nPool" as httpcl
+participant "StreamLoadRunner\n(CommandLineRunner)" as runner
+participant "DataPipeline" as pipeline
+participant "Producer\n(Thread)" as producer
+participant "Consumer\n(Thread x3)" as consumer
+participant "MySQL\n(source_db)" as mysql
+participant "Doris\n(target_db)" as doris
+
+== Maven 启动阶段
+user -> maven : mvn spring-boot:run\n-Dspring-boot.run.profiles=test
+activate maven
+maven -> plugin : 触发 spring-boot:run 目标
+activate plugin
+plugin -> plugin : 解析命令行参数\n-Dspring-boot.run.profiles=test
+plugin -> plugin : 设置环境变量\nSPRING_PROFILES_ACTIVE=test
+plugin -> loader : 启动 Spring Boot\n应用程序类加载器
+activate loader
+loader -> loader : 扫描 classpath\n查找 META-INF/\nspring.factories
+note right: Spring Boot 3.x 使用\nspring-boot-autoconfigure
+
+== Profile 激活与 Bean 注册
+loader -> context : SpringApplication.run()\n激活 test profile
+activate context
+context -> context : 加载 application.yml\n(基础配置)
+context -> context : 加载 application-test.yml\n(test 覆盖配置)
+note right
+  test profile 覆盖项:
+  - batch-size: 80000
+  - enable-compression: false
+  - timeout: 600
+  - checkpoint-file: ./checkpoint-test.json
+  - consumer-threads: 3
+  - use-nginx-proxy: true
+end note
+
+== 数据源与 Bean 初始化
+context -> dsconfig : 扫描 @Configuration
+activate dsconfig
+dsconfig -> dprops : 绑定 doris.* (test)
+activate dprops
+dprops --> dsconfig : DorisProperties 就绪
+deactivate dprops
+dsconfig -> dsconfig : 创建 @Primary DataSource
+note right
+  MySQL 连接:
+  jdbc:mysql://127.0.0.1:3306/test_db
+  pool-size: 5, min-idle: 2
+end note
+dsconfig -> hikari : 创建 HikariDataSource
+activate hikari
+hikari -> mysql : 建立 JDBC 连接池
+deactivate hikari
+dsconfig -> dsconfig : 创建 dorisDataSource
+note right
+  Doris JDBC:
+  jdbc:mysql://<host>:9030/test_db
+  pool-size: 3, min-idle: 1
+end note
+dsconfig --> context : JdbcTemplate Bean
+
+== 核心 Bean 初始化
+context -> ckpt : 实例化 CheckpointManager
+activate ckpt
+ckpt -> ckpt : 加载 checkpoint-test.json
+note right
+  断点续传文件:
+  ./checkpoint-test.json
+end note
+ckpt --> context : 就绪
+
+context -> sload : 实例化 StreamLoadService
+activate sload
+sload -> sload : 构建 Basic Auth Header
+sload -> httpcl : 创建 PoolingHttpClientConnectionManager
+activate httpcl
+httpcl -> httpcl : maxTotal=20,\ndefaultMaxPerRoute=10
+httpcl --> sload : 连接池就绪
+deactivate httpcl
+sload -> sload : 初始化 ObjectMapper
+sload --> context : 就绪
+
+context -> runner : 注入 StreamLoadRunner
+activate runner
+note right
+  实现 CommandLineRunner, ExitCodeGenerator
+end note
+
+== 应用启动完成
+context --> loader : ApplicationContext 刷新完成
+note left
+  所有 Bean 初始化完毕
+  test profile 配置已生效
+end note
+loader --> plugin : JVM 进程运行中
+deactivate loader
+deactivate context
+deactivate dsconfig
+deactivate ckpt
+deactivate sload
+deactivate runner
+
+== CommandLineRunner 执行
+plugin -> user : 程序运行中...\n(等待导入完成)
+note right
+  StreamLoadRunner.run() 自动执行
+end note
+
+runner -> runner : 打印启动日志
+note right
+  源数据库: http://127.0.0.1:8030
+  目标数据库: test_db
+  批次大小: 80000
+  启用压缩: false
+  最大重试: 3
+  断点文件: ./checkpoint-test.json
+end note
+
+runner -> vprops : buildVerifyParam()
+activate vprops
+vprops -> vprops : 读取 verify.mode=COUNT
+vprops -> vprops : 读取 verify.source-sql
+vprops -> vprops : 读取 verify.target-table
+vprops --> runner : VerifyParam 就绪
+deactivate vprops
+
+runner -> pipeline : new DataPipeline(\n  jdbcTemplate,\n  streamLoadService,\n  dorisProperties,\n  sourceSql,\n  tableName)
+activate pipeline
+pipeline -> pipeline : 创建 LinkedBlockingQueue\n(capacity=1000)
+pipeline -> pipeline : 初始化 ThreadLocal<SimpleDateFormat>
+pipeline --> runner : Pipeline 实例就绪
+deactivate pipeline
+
+== 启动进度监控线程
+runner -> runner : 创建 progress-monitor Daemon 线程
+note right
+  每 5 秒输出一次进度:
+  生产批次/记录数, 消费批次/记录数, 失败批次
+end note
+runner -> runner : progressThread.start()
+
+== 流水线执行 (Producer-Consumer)
+runner -> pipeline : execute()
+activate pipeline
+
+pipeline -> pipeline : 创建 ExecutorService\n(1 producer + 3 consumers)
+
+par Producer 线程
+    pipeline -> producer : produce()
+    activate producer
+    producer -> mysql : 流式查询\n(source_sql)
+    activate mysql
+    mysql --> producer : ResultSet (游标)
+    deactivate mysql
+    
+    loop 每 batch-size (80000 条)
+        producer -> producer : 累积一批数据
+        producer -> pipeline : queue.offer(BatchData)
+        note right
+          队列满时阻塞等待
+        end note
+    end
+    
+    producer -> pipeline : queue.offer(POISON_PILL)
+    note right
+      发送毒丸标识完成
+    end note
+    deactivate producer
+end
+
+par Consumer 线程 (x3)
+    loop 3 个消费者并发
+        consumer -> pipeline : consume()
+        activate consumer
+        consumer -> pipeline : queue.take()
+        note right
+          从队列获取 BatchData
+        end note
+        
+        alt 收到普通批次
+            consumer -> sload : executeLoad(\n  batchIndex,\n  tableName,\n  data)
+            activate sload
+            
+            sload -> sload : 检查 checkpoint\n(是否已完成)
+            
+            alt 批次未完成
+                sload -> sload : 生成唯一 label
+                sload -> sload : 序列化 JSON
+                note right
+                  test profile: 不启用压缩
+                end note
+                
+                sload -> httpcl : 获取连接
+                activate httpcl
+                httpcl --> sload : 复用连接
+                deactivate httpcl
+                
+                sload -> doris : HTTP PUT\n/api/{db}/{tbl}/_stream_load
+                activate doris
+                doris --> sload : LoadResponse\n(Status: OK)
+                deactivate doris
+                
+                sload -> ckpt : saveCheckpoint(\n  batchIndex)
+                activate ckpt
+                ckpt --> sload : 已保存
+                deactivate ckpt
+                
+                sload --> consumer : LoadResult(success)
+                deactivate sload
+            else 批次已完成
+                sload --> consumer : LoadResult(SKIPPED)
+            end
+            
+            consumer -> consumer : 更新统计计数
+        else 收到毒丸
+            consumer -> consumer : consumerCompleted=true
+            consumer -> consumer : break 循环
+        end
+        deactivate consumer
+    end
+end
+
+pipeline --> runner : totalRecords (总导入数)
+deactivate pipeline
+
+== 进度监控输出
+runner -> runner : 打印导入统计
+note right
+  ========================================
+  导入完成!
+  总记录数: xxxxxx
+  总耗时: xx 秒
+  吞吐量: xxxxx 条/秒
+  ========================================
+end note
+
+== 数据验证
+opt verify.mode != NONE (COUNT)
+    runner -> vprops : verify(verifyParam)
+    activate vprops
+    vprops -> mysql : 查询源表记录数
+    activate mysql
+    mysql --> vprops : sourceCount
+    deactivate mysql
+    vprops -> doris : 查询目标表记录数
+    activate doris
+    doris --> vprops : targetCount
+    deactivate doris
+    vprops -> vprops : 对比 sourceCount vs targetCount
+    vprops --> runner : VerifyResult(passed=true)
+    deactivate vprops
+    
+    runner -> runner : 打印验证结果
+    note right
+      验证结果: 通过
+      验证详情: 源表记录数 = 目标表记录数
+    end note
+end
+
+== 清理与退出
+runner -> ckpt : clearCheckpoint()
+activate ckpt
+ckpt -> ckpt : 删除 checkpoint-test.json
+ckpt --> runner : 清理完成
+deactivate ckpt
+
+runner -> runner : 设置 exitCode=0
+runner -> app : System.exit(0)
+activate app
+app --> maven : 进程退出
+
+note left
+  ====================================================
+  整个流程总结:
+  
+  1. Maven 解析 -Dspring-boot.run.profiles=test
+  2. Spring Boot 加载 application-test.yml
+  3. 初始化 MySQL/Doris 数据源
+  4. 创建 StreamLoadService (HTTP 连接池)
+  5. StreamLoadRunner 触发数据导入流水线
+  6. Producer 从 MySQL 流式读取 -> 队列
+  7. 3 个 Consumer 从队列取数据 -> Doris Stream Load
+  8. 进度监控线程实时输出统计
+  9. 导入完成后执行 COUNT 验证
+  10. 清除断点文件, 正常退出
+  ====================================================
+end note
+
+@enduml
